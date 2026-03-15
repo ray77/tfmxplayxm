@@ -196,6 +196,9 @@ bool parHelp(string) {
       printf("  -%s: %s\n",i.name.c_str(),i.desc.c_str());
     }
   }
+  printf("Runtime keys:\n");
+  printf("  Tab: next subsong\n");
+  printf("  Shift+Tab: previous subsong\n");
   return false;
 }
 
@@ -470,6 +473,18 @@ int main(int argc, char** argv) {
     c=fgetc(stdin);
     if (c==EOF) break;
     switch (c) {
+      case '\t':
+        songid=(songid+1)%32;
+        p.play(songid);
+        printf("subsong %d\n",songid);
+        break;
+      case 27:
+        if (fgetc(stdin)=='[' && fgetc(stdin)=='Z') {
+          songid=(songid+31)%32;
+          p.play(songid);
+          printf("subsong %d\n",songid);
+        }
+        break;
       case '\n':
       case '\r':
         p.trace=!p.trace;
