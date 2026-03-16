@@ -35,6 +35,8 @@ Keys are read from the terminal while the player is running.
 
 
 EXAMPLE:
-./tfmxplay -convert2xm=T2w1.xm mdat.T2_World
+./tfmxplay -convert2xm=T2w1.xm mdat.T2_World1
+
+*** Try with Turrican 2 World 01 *** ENJOY!
 
 ![hippo](img/v001.gif)
