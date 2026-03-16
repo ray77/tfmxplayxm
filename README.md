@@ -7,6 +7,8 @@ the player / converter strives to meet Turrican 2 standards.
 
 Keys are read from the terminal while the player is running.
 
+![Console01](img/console01.png)
+
 | Key | Action |
 |-----|--------|
 | **Tab** | Next subsong |
