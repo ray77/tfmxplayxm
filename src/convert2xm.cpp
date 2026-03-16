@@ -85,6 +85,9 @@ struct MacroSampleInfo {
   bool oneShot;    /* true if macro contains mOneShot (disables looping) */
   bool hasSetLoop; /* true if macro contains mSetLoop (explicit loop point) */
   int addNote;     /* pitch transposition in semitones from mAddNote */
+  int atkStart;    /* attack phase sample offset in smpl (-1 = none) */
+  int atkLen;      /* attack phase sample length in bytes */
+  int setNoteVal;  /* mSetNote value before mOn; -1 = no fixed attack pitch */
 };
 
 /*
@@ -123,12 +126,13 @@ struct MacroEffectInfo {
  * that the listener perceives as the instrument's timbre.
  */
 static MacroSampleInfo getMacroSample(const TFMXMacroData macro[256]) {
-  MacroSampleInfo info = { 0, 512, 0, 0, false, false, 0 };
+  MacroSampleInfo info = { 0, 512, 0, 0, false, false, 0, -1, 0, -1 };
   int curStart = 0;
   int curLenWords = 256;   /* TFMX lengths are in 16-bit words */
   bool gotAny = false;
   bool gotAddNote = false;
   bool afterOn = false;
+  int preOnSetNote = -1;   /* mSetNote value found before mOn */
 
   int onStart = 0, onLen = 512;
   int postStart = -1, postLen = -1;
@@ -145,6 +149,9 @@ static MacroSampleInfo getMacroSample(const TFMXMacroData macro[256]) {
         if (curLenWords <= 0) curLenWords = 256;
         if (afterOn && postLen < 0) postLen = curLenWords;
         else if (afterOn) postLen = curLenWords;
+        break;
+      case mSetNote:
+        if (!afterOn) preOnSetNote = macro[i].data[0];
         break;
       case mOn:
         onStart = curStart;
@@ -181,6 +188,14 @@ done:
     if (postStart >= 0 && postLen > 0) {
       info.start = postStart;
       info.len = postLen * 2;
+      /* Multi-phase macro with mSetNote before mOn: the pre-mOn sample
+       * plays at a fixed pitch on the Amiga hardware channel.  Store the
+       * attack info so the simulation can emit it on an overflow channel. */
+      if (preOnSetNote >= 0) {
+        info.atkStart   = onStart;
+        info.atkLen     = onLen * 2;
+        info.setNoteVal = preOnSetNote;
+      }
     } else {
       info.start = onStart;
       info.len = onLen * 2;
@@ -537,7 +552,9 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
    * =================================================================== */
   const int ROWS_PER_PAT = 64;
   const int MAX_TOTAL_ROWS = ROWS_PER_PAT * 256;
-  int numChans = 8;
+  const int BASE_CHANS = 8;    /* original TFMX channels */
+  const int OVERFLOW_CHANS = 4; /* extra channels for multi-phase attack transients */
+  int numChans = BASE_CHANS + OVERFLOW_CHANS;
 
   /* One cell per channel per row — matches XM's packed pattern cell format */
   struct XMCell { unsigned char note, inst, vol, fx, param; };
@@ -586,10 +603,12 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   int totalXmRows = 0;
 
   /* Set initial Amiga stereo panning (XM effect 8xx).
-   * Classic Amiga panning pattern: L,R,R,L,L,R,R,L  (channels 0-7)
-   * Formula: isRight = (ch & 1) XOR ((ch & 2) >> 1) */
+   * Classic Amiga panning pattern: L,R,R,L,L,R,R,L  (channels 0-7).
+   * Overflow channels (8+) mirror the panning of the original channel
+   * they serve (overflow ch N+8 matches ch N). */
   for (int ch = 0; ch < numChans; ch++) {
-    bool isRight = (ch & 1) ^ ((ch & 2) >> 1);
+    int srcCh = (ch >= BASE_CHANS) ? (ch - BASE_CHANS) : ch;
+    bool isRight = (srcCh & 1) ^ ((srcCh & 2) >> 1);
     bigGrid[ch].fx = 8;
     bigGrid[ch].param = isRight ? 0xD0 : 0x30;
   }
@@ -604,6 +623,20 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
    * correct effective volume (accounting for mAddVol/mSetVol). */
   MacroEffectInfo macroFX[128];
   for (int i = 0; i < 128; i++) macroFX[i] = getMacroEffects(macro[i], xmSpeed);
+
+  /* Pre-compute sample info for all macros (needed for attack overflow).
+   * For macros with mSetNote before mOn, the pre-mOn sample is a fixed-pitch
+   * attack transient.  We map each such macro to an attack XM instrument
+   * stored in the upper instrument slots (macro + 65). */
+  MacroSampleInfo macroSI[128];
+  int atkInstMap[128];  /* atkInstMap[m] = XM instrument number (1-based) for attack; 0 = none */
+  for (int i = 0; i < 128; i++) {
+    macroSI[i] = getMacroSample(macro[i]);
+    atkInstMap[i] = 0;
+    if (macroSI[i].setNoteVal >= 0 && macroSI[i].atkLen > 0 && i + 64 < 128) {
+      atkInstMap[i] = i + 64 + 1;
+    }
+  }
 
   int startRow = head.songStart[subsong];
   int endRow = head.songEnd[subsong];
@@ -623,7 +656,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
       if (p == 0x80) continue;
       if (p == 0xFE) {
         int ch = track[ordRow][t].trans;
-        if (ch >= 0 && ch < numChans && totalXmRows < MAX_TOTAL_ROWS) {
+        if (ch >= 0 && ch < BASE_CHANS && totalXmRows < MAX_TOTAL_ROWS) {
           bigGrid[totalXmRows * numChans + ch].vol = 0x10;
         }
         ts[t].baseOff = -1;
@@ -755,7 +788,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                * from its current level toward 'detune' by 'ins' units every
                * (vol+1) ticks. Used for chord pad fades and other gradual changes. */
               int ch = item.chan;
-              if (ch >= 0 && ch < numChans) {
+              if (ch >= 0 && ch < BASE_CHANS) {
                 chanEnv[ch].amt = item.ins;
                 chanEnv[ch].timeReset = item.vol + 1;
                 chanEnv[ch].timeC = item.vol + 1;
@@ -769,10 +802,33 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                * Mapped to XM note-off (97), which triggers the release phase
                * of the macro envelope in post-processing. */
               int ch = item.chan;
-              if (ch >= 0 && ch < numChans && totalXmRows < MAX_TOTAL_ROWS)
+              if (ch >= 0 && ch < BASE_CHANS && totalXmRows < MAX_TOTAL_ROWS)
                 bigGrid[totalXmRows * numChans + ch].note = 97;
               break;
             }
+            case pPPat: {
+              /* PPat (0xFB): redirect another track to play a different pattern.
+               * item.ins  = pattern number to start
+               * item.chan  = target track (0-7) to redirect
+               * item.detune = transposition for the new pattern
+               * The calling track continues executing its own commands. */
+              int targetTrack = item.chan;
+              if (targetTrack >= 0 && targetTrack < 8 && item.ins < 128) {
+                ts[targetTrack].baseOff = patPoint[item.ins];
+                ts[targetTrack].trans = (signed char)item.detune;
+                ts[targetTrack].pos = -1;
+                ts[targetTrack].tim = 0;
+                ts[targetTrack].loopCount = 0;
+                ts[targetTrack].inGosub = false;
+              }
+              break;
+            }
+            case pStCu:
+              /* Stop Custom: freeze this track permanently (like pStop but
+               * keeps the track "alive" — just sets an infinite timer). */
+              ts[t].tim = 0x7fffffff;
+              getMeOut = true;
+              break;
             case pNOP: break;
             default:
               if (item.note >= 0xf0) break;
@@ -780,13 +836,15 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
 
               {
                 /* Regular note event. TFMX note = 6-bit pitch + transposition.
-                 * The +25 offset maps TFMX's note range into XM's 1-96 range. */
+                 * The +25 offset maps TFMX notes to XM so that the effective
+                 * playback frequency (after per-instrument relativeNote from
+                 * mAddNote) matches the original TFMX NTSC period within 0.2%. */
                 int rawNote = (item.note & 0x3f) + ts[t].trans;
                 int xmNote = rawNote + 25;
                 if (xmNote < 1) xmNote = 1;
                 if (xmNote > 96) xmNote = 96;
                 int ch = item.chan;
-                if (ch < 0 || ch >= numChans) ch = 0;
+                if (ch < 0 || ch >= BASE_CHANS) ch = 0;
                 if (totalXmRows < MAX_TOTAL_ROWS) {
                   XMCell* cell = &bigGrid[totalXmRows * numChans + ch];
                   cell->note = (unsigned char)xmNote;
@@ -813,6 +871,23 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                     chanEnv[ch].vol = v * 4;
                   }
                   chanEnv[ch].active = false;
+
+                  /* Multi-phase attack: if this macro has mSetNote before mOn,
+                   * emit the fixed-pitch attack transient on an overflow channel.
+                   * The attack instrument is a one-shot sample that plays at the
+                   * mSetNote frequency, independent of the pattern note. */
+                  int macIdx = item.ins;
+                  if (macIdx >= 0 && macIdx < 128 && atkInstMap[macIdx] > 0 &&
+                      ch < OVERFLOW_CHANS) {
+                    int ovfCh = BASE_CHANS + ch;
+                    int atkNote = macroSI[macIdx].setNoteVal + 25;
+                    if (atkNote >= 1 && atkNote <= 96) {
+                      XMCell* atkCell = &bigGrid[totalXmRows * numChans + ovfCh];
+                      atkCell->note = (unsigned char)atkNote;
+                      atkCell->inst = (unsigned char)atkInstMap[macIdx];
+                      atkCell->vol  = cell->vol;
+                    }
+                  }
                 }
                 /* TFMX note types: bits 7:6 = 10 (0x80-0xBF) or note=0x7F
                  * indicate "note + wait" — the detune field becomes the wait count. */
@@ -825,25 +900,30 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
           }
         }
       }
-      /* Apply active pEnve (pattern-level envelopes) each tick.
-       * This runs after all tracks have been processed for this tick.
-       * Each active envelope counts down its timer; when it fires, it nudges
-       * the channel volume toward the target. The result is written to the
-       * XM grid only if the cell is otherwise empty (to avoid overwriting
-       * note events that already carry their own volume). */
-      if (totalXmRows < MAX_TOTAL_ROWS) {
-        for (int c = 0; c < numChans; c++) {
+      /* Apply active pEnve (pattern-level envelopes).
+       * In real TFMX hardware, envelopes run per-frame (~50Hz), while
+       * pattern commands run per-tick (every xmSpeed frames). So the
+       * envelope fires xmSpeed times per simulation tick (= 1 XM row).
+       * We loop xmSpeed times here to match the original fade speed.
+       *
+       * Skip when rowDone: the pEnd tick is a boundary artefact — the
+       * next order row's first tick will also target the same XM row.
+       * Firing pEnve for both would double the fade speed. */
+      if (totalXmRows < MAX_TOTAL_ROWS && !rowDone) {
+        for (int c = 0; c < BASE_CHANS; c++) {
           if (!chanEnv[c].active) continue;
-          if (--chanEnv[c].timeC <= 0) {
-            chanEnv[c].timeC = chanEnv[c].timeReset;
-            if (chanEnv[c].vol < chanEnv[c].target)
-              chanEnv[c].vol = (chanEnv[c].vol + chanEnv[c].amt < chanEnv[c].target)
-                                ? chanEnv[c].vol + chanEnv[c].amt : chanEnv[c].target;
-            else if (chanEnv[c].vol > chanEnv[c].target)
-              chanEnv[c].vol = (chanEnv[c].vol - chanEnv[c].amt > chanEnv[c].target)
-                                ? chanEnv[c].vol - chanEnv[c].amt : chanEnv[c].target;
-            if (chanEnv[c].vol == chanEnv[c].target)
-              chanEnv[c].active = false;
+          for (int fr = 0; fr < xmSpeed && chanEnv[c].active; fr++) {
+            if (--chanEnv[c].timeC <= 0) {
+              chanEnv[c].timeC = chanEnv[c].timeReset;
+              if (chanEnv[c].vol < chanEnv[c].target)
+                chanEnv[c].vol = (chanEnv[c].vol + chanEnv[c].amt < chanEnv[c].target)
+                                  ? chanEnv[c].vol + chanEnv[c].amt : chanEnv[c].target;
+              else if (chanEnv[c].vol > chanEnv[c].target)
+                chanEnv[c].vol = (chanEnv[c].vol - chanEnv[c].amt > chanEnv[c].target)
+                                  ? chanEnv[c].vol - chanEnv[c].amt : chanEnv[c].target;
+              if (chanEnv[c].vol == chanEnv[c].target)
+                chanEnv[c].active = false;
+            }
           }
           XMCell* cell = &bigGrid[totalXmRows * numChans + c];
           if (cell->note == 0 && cell->inst == 0 && cell->vol == 0) {
@@ -879,6 +959,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     int releaseSlide = 0;
     bool inRelease = false;
     int curVibS = 0, curVibD = 0;
+    int runningVol = 0; /* track actual volume to stop slides at 0 */
     bool isRight = (ch & 1) ^ ((ch & 2) >> 1);
     unsigned char panParam = isRight ? 0xD0 : 0x30;
 
@@ -904,6 +985,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
           if (effVol > 64) effVol = 64;
           if (effVol < 0) effVol = 0;
           cell->vol = (unsigned char)(0x10 + effVol);
+          runningVol = effVol;
 
           /* Panning on every note row ensures stereo is maintained even if
            * the tracker resets panning on new notes. */
@@ -946,29 +1028,38 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
         vibActive = false;
         vibPending = false;
       } else if (cell->note == 0 && cell->inst == 0) {
-        /* --- Continuation row (no new note): apply ongoing effects ---
-         * Vibrato: first empty row gets full 4xy, subsequent rows get 4-00
-         * (continue previous vibrato parameters). */
+        /* --- Continuation row (no new note): apply ongoing effects --- */
+
+        /* Vibrato: first empty row gets full 4xy, subsequent rows get 4-00 */
         if (vibPending && cell->fx == 0) {
           cell->fx = 4;
           cell->param = (unsigned char)((curVibS << 4) | curVibD);
           vibPending = false;
         } else if (vibActive && cell->fx == 0) {
           cell->fx = 4;
-          cell->param = 0; /* XM: 4-00 means "continue vibrato" */
+          cell->param = 0;
         }
-        /* Volume envelope slide: written to the volume column.
-         * XM volume column: 0x60+n = slide down by n, 0x70+n = slide up by n.
-         * Only written if the cell doesn't already have a volume value
-         * (e.g., from a pEnve pattern envelope). */
+        /* Volume envelope slide: track running volume and stop at 0.
+         * Without this, slides continue endlessly across section boundaries
+         * where no new notes appear to reset the envelope state. */
         if (envSlide != 0 && cell->vol == 0) {
           if (envDelayLeft > 0) {
             envDelayLeft--;
+          } else if (runningVol > 0) {
+            runningVol += envSlide;
+            if (runningVol <= 0) {
+              runningVol = 0;
+              envSlide = 0;
+              vibActive = false;
+              vibPending = false;
+            } else {
+              if (envSlide < 0)
+                cell->vol = (unsigned char)(0x60 + (-envSlide));
+              else if (envSlide > 0)
+                cell->vol = (unsigned char)(0x70 + envSlide);
+            }
           } else {
-            if (envSlide < 0)
-              cell->vol = (unsigned char)(0x60 + (-envSlide));
-            else if (envSlide > 0)
-              cell->vol = (unsigned char)(0x70 + envSlide);
+            envSlide = 0;
           }
         }
       }
@@ -991,7 +1082,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   /* XM header fields (at offset 60, inside the 276-byte header block) */
   writeU16(out, (unsigned short)songLen);  /* song length in patterns */
   writeU16(out, 0);                        /* restart position */
-  writeU16(out, 8);                        /* number of channels */
+  writeU16(out, (unsigned short)numChans);  /* number of channels */
   writeU16(out, (unsigned short)numPatterns);
   writeU16(out, 128);                      /* number of instruments */
   writeU16(out, 1);                        /* flags: 1 = linear frequency table */
@@ -1044,47 +1135,69 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   free(bigGrid);
 
   /* ===================================================================
-   * PHASE 4: Write 128 XM instruments, one per TFMX macro.
+   * PHASE 4: Write 128 XM instruments.
    *
-   * Each XM instrument contains exactly one sample extracted from the
-   * smpl file at the offset/length specified by the macro's mSetBegin/mSetLen.
-   * The sample is delta-encoded as required by XM. Loop points come from
-   * mSetLoop; oneShot macros get no loop. No volume/panning envelopes are
-   * used (those are handled by pattern effects in the grid).
+   * Slots 1-128 normally hold sustain instruments (one per TFMX macro).
+   * For macros with mSetNote before mOn, the slot at (macroIdx + 65) is
+   * repurposed as a one-shot attack instrument containing the pre-mOn
+   * sample.  This attack instrument plays at a fixed pitch on an overflow
+   * channel, matching the Amiga hardware's DMA behaviour.
    * =================================================================== */
   for (int inst = 0; inst < 128; inst++) {
-    MacroSampleInfo si = getMacroSample(macro[inst]);
-    if (si.start + si.len > (int)smplLen) {
-      si.start = 0;
-      si.len = 512;
-      si.oneShot = true;
+    /* Check if this slot should hold an attack instrument instead of the
+     * normal sustain instrument for macro[inst]. */
+    int atkSrcMacro = -1;
+    for (int m = 0; m < 64; m++) {
+      if (atkInstMap[m] == inst + 1) { atkSrcMacro = m; break; }
     }
-    if (si.len < 4) si.len = 4;
 
+    int smpStart, smpLen;
     unsigned char loopType = 0;
-    unsigned int xmLoopStart = 0;
-    unsigned int xmLoopLen = 0;
-    if (si.oneShot) {
+    unsigned int xmLoopStart = 0, xmLoopLen = 0;
+    signed char relNote = 0;
+    char labelBuf[22];
+
+    if (atkSrcMacro >= 0) {
+      /* Attack instrument: one-shot, no loop, relativeNote = 0 */
+      smpStart = macroSI[atkSrcMacro].atkStart;
+      smpLen   = macroSI[atkSrcMacro].atkLen;
+      if (smpStart + smpLen > (int)smplLen) { smpStart = 0; smpLen = 4; }
+      if (smpLen < 4) smpLen = 4;
       loopType = 0;
-    } else if (si.hasSetLoop) {
-      loopType = 1;
-      xmLoopStart = (unsigned int)si.loopStart;
-      xmLoopLen = (unsigned int)si.loopLen;
-      if (xmLoopStart + xmLoopLen > (unsigned int)si.len) {
-        xmLoopLen = (unsigned int)si.len - xmLoopStart;
-      }
-      if (xmLoopLen < 2) { xmLoopLen = 2; }
+      relNote  = 0;
+      snprintf(labelBuf, 22, "Atk M%03d", atkSrcMacro);
     } else {
-      loopType = 1;
-      xmLoopStart = 0;
-      xmLoopLen = (unsigned int)si.len;
+      MacroSampleInfo si = macroSI[inst];
+      if (si.start + si.len > (int)smplLen) {
+        si.start = 0; si.len = 512; si.oneShot = true;
+      }
+      if (si.len < 4) si.len = 4;
+      smpStart = si.start;
+      smpLen   = si.len;
+      relNote  = (signed char)si.addNote;
+
+      if (si.oneShot) {
+        loopType = 0;
+      } else if (si.hasSetLoop) {
+        loopType = 1;
+        xmLoopStart = (unsigned int)si.loopStart;
+        xmLoopLen = (unsigned int)si.loopLen;
+        if (xmLoopStart + xmLoopLen > (unsigned int)smpLen)
+          xmLoopLen = (unsigned int)smpLen - xmLoopStart;
+        if (xmLoopLen < 2) xmLoopLen = 2;
+      } else {
+        loopType = 1;
+        xmLoopStart = 0;
+        xmLoopLen = (unsigned int)smpLen;
+      }
+      snprintf(labelBuf, 22, "Instrument %03d", inst + 1);
     }
 
     writeU32(out, 263);  /* instrument header size (including sample header) */
 
     char instName[22];
     memset(instName, 0, 22);
-    snprintf(instName, 22, "Instrument %03d", inst + 1);
+    snprintf(instName, 22, "%s", labelBuf);
     fwrite(instName, 1, 22, out);
     fputc(0, out);          /* instrument type (always 0) */
     writeU16(out, 1);       /* number of samples in this instrument */
@@ -1103,24 +1216,24 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     { unsigned char res[22]; memset(res, 0, 22); fwrite(res, 1, 22, out); } /* reserved */
 
     /* Sample header (40 bytes) */
-    writeU32(out, (unsigned int)si.len);      /* sample length in bytes */
+    writeU32(out, (unsigned int)smpLen);       /* sample length in bytes */
     writeU32(out, xmLoopStart);               /* loop start */
     writeU32(out, xmLoopLen);                 /* loop length */
     fputc(64, out);                           /* default volume (64 = max) */
     fputc(0, out);                            /* finetune (signed, 0 = none) */
     fputc(loopType, out);                     /* 0=none, 1=forward, 2=ping-pong */
     fputc(128, out);                          /* panning (128 = center) */
-    fputc((unsigned char)(signed char)si.addNote, out);  /* relative note (semitone offset) */
+    fputc((unsigned char)relNote, out);       /* relative note */
     fputc(0, out);                            /* reserved / encoding (0 = delta) */
     memset(instName, 0, 22);
-    snprintf(instName, 22, "Sample %03d", inst + 1);
+    snprintf(instName, 22, "%s", labelBuf);
     fwrite(instName, 1, 22, out);
 
     /* Write delta-encoded sample data immediately after sample header */
-    unsigned char* delta = (unsigned char*)malloc((size_t)si.len);
+    unsigned char* delta = (unsigned char*)malloc((size_t)smpLen);
     if (delta) {
-      deltaEncode8(smpl + si.start, si.len, delta);
-      fwrite(delta, 1, (size_t)si.len, out);
+      deltaEncode8(smpl + smpStart, smpLen, delta);
+      fwrite(delta, 1, (size_t)smpLen, out);
       free(delta);
     }
   }
