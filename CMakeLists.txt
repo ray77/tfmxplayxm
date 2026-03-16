@@ -25,7 +25,7 @@ else()
   set(CMAKE_FIND_USE_CMAKE_SYSTEM_PATH ON)
 endif()
 
-add_executable(tfmxplay src/blip_buf.c src/sinc.cpp src/tfmx.cpp src/tfmxplay.cpp src/time.cpp)
+add_executable(tfmxplay src/blip_buf.c src/sinc.cpp src/tfmx.cpp src/tfmxplay.cpp src/time.cpp src/convert2xm.cpp)
 target_compile_definitions(tfmxplay PRIVATE TFMXPLAY_VERSION="${PROJECT_VERSION}")
 
 if (HAVE_DRM)

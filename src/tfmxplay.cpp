@@ -30,6 +30,7 @@
 
 #include "blip_buf.h"
 #include "tfmx.h"
+#include "convert2xm.h"
 
 typedef std::string string;
 
@@ -62,7 +63,8 @@ SDL_AudioDeviceID ai;
 SDL_AudioSpec ac;
 SDL_AudioSpec ar;
 
-bool quit, ntsc, hle, dumpFile, showVersionOnly;
+bool quit, ntsc, hle, dumpFile, showVersionOnly, doConvert2XM;
+std::string convert2xmPath;
 FILE* dump;
 
 int sr, speed;
@@ -199,6 +201,7 @@ bool parHelp(string) {
   printf("Runtime keys:\n");
   printf("  Tab: next subsong\n");
   printf("  Shift+Tab: previous subsong\n");
+  printf("  -convert2xm (file.xm): convert TFMX to XM and exit\n");
   return false;
 }
 
@@ -253,6 +256,12 @@ bool parVersion(string) {
   return true;
 }
 
+bool parConvert2XM(string v) {
+  doConvert2XM=true;
+  convert2xmPath=v;
+  return true;
+}
+
 void initParams() {
   params.push_back(Param("h","help",false,parHelp,"","display this help"));
   params.push_back(Param("v","version",false,parVersion,"","show version"));
@@ -262,6 +271,7 @@ void initParams() {
   params.push_back(Param("l","hle",false,parHLE,"","use high-level emulation (lower quality but much faster)"));
   params.push_back(Param("d","dump",false,parDump,"","dump 16-bit stereo raw output to tfmx.raw"));
   params.push_back(Param("S","speed",true,parSpeed,"","set speed in clock/2 cycles"));
+  params.push_back(Param("c","convert2xm",false,parConvert2XM,"[=file.xm]","convert TFMX to XM and write file (default: mdat name with .xm)"));
 
 #ifdef _SYNC_VBLANK
   params.push_back(Param("V","vblank",false,parVBlank,"","sync to VBlank"));
@@ -274,6 +284,8 @@ int main(int argc, char** argv) {
   ntsc=false;
   dumpFile=false;
   showVersionOnly=false;
+  doConvert2XM=false;
+  convert2xmPath="";
   songid=0;
 #ifdef _SYNC_VBLANK
   syncVBlank=false;
@@ -345,6 +357,20 @@ int main(int argc, char** argv) {
     }
     smpl=mdat;
     smpl.replace(repPos,4,"smpl");
+  }
+
+  if (doConvert2XM) {
+    string outPath=convert2xmPath;
+    if (outPath.empty()) {
+      outPath=mdat;
+      size_t dot=outPath.rfind('.');
+      if (dot!=string::npos) outPath=outPath.substr(0,dot);
+      outPath+=".xm";
+    }
+    if (!convertToXM(mdat.c_str(),smpl.c_str(),outPath.c_str(),songid)) {
+      return 1;
+    }
+    return 0;
   }
 
   if (!p.load(mdat.c_str(),smpl.c_str())) {
