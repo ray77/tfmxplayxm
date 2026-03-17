@@ -3,6 +3,7 @@
 
 The Player / Converter strives to meet Turrican 2 standards.
 The new XM Converter generates an easily editable, readable XM file. (No data mush like with similar converters.) Macros are mapped to additional tracks using XM note parameters. As a result, the converted songs may not sound 100% like the original, but they are easy to edit.
+ALPHA-VERSION: Only testet mit T2_WORLD1_SONG0
 
 ## Runtime keys
 
