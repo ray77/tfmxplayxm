@@ -4,7 +4,7 @@
 The Player / Converter strives to meet Turrican 2 standards.
 The new XM Converter generates an easily editable, readable XM file. (No data mush like with similar converters.) Macros are mapped to additional tracks using XM note parameters. As a result, the converted songs may not sound 100% like the original, but they are easy to edit.
 
-XM-CONVERTER - ALPHA-VERSION: Only testet with T2_WORLD1_SONG0 *wait for updates*
+XM-CONVERTER - EARLY ALPHA-VERSION: Only testet with T2_WORLD1_SONG0 *wait for updates*
 
 ## Runtime keys
 
@@ -40,6 +40,6 @@ Keys are read from the terminal while the player is running.
 EXAMPLE:
 ./tfmxplay -convert2xm=T2w1.xm mdat.T2_World1
 
-*** Try with Turrican 2 World 01 *** ENJOY!
+*** Try with Turrican 2 World 01 (SUB00) *** ENJOY!
 
 ![hippo](img/v001.gif)
