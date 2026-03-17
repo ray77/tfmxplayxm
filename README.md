@@ -40,6 +40,4 @@ EXAMPLE:
 
 *** Try with Turrican 2 World 01 *** ENJOY!
 
-![hippo](img/v000.gif)
-
 ![hippo](img/v001.gif)
