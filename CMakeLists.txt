@@ -43,7 +43,8 @@ if (HAVE_DRM)
 endif()
 
 if (SDL2_INCLUDE_DIR)
-  target_include_directories(tfmxplay PRIVATE ${SDL2_INCLUDE_DIR})
+  get_filename_component(SDL2_INCLUDE_PARENT "${SDL2_INCLUDE_DIR}" DIRECTORY)
+  target_include_directories(tfmxplay PRIVATE ${SDL2_INCLUDE_DIR} ${SDL2_INCLUDE_PARENT})
 endif()
 
 if (WIN32 AND MINGW)
