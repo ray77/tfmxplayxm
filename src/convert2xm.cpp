@@ -577,7 +577,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   const int ROWS_PER_PAT = 64;
   const int MAX_TOTAL_ROWS = ROWS_PER_PAT * 256;
   const int BASE_CHANS = 8;    /* original TFMX channels */
-  const int OVERFLOW_CHANS = 4; /* extra channels for multi-phase attack transients */
+  const int OVERFLOW_CHANS = 4; /* attack transients: only Amiga ch 0–3 → XM ch 9–12 */
   int numChans = BASE_CHANS + OVERFLOW_CHANS;
 
   /* One cell per channel per row — matches XM's packed pattern cell format */
@@ -656,9 +656,22 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   for (int i = 0; i < 128; i++) {
     macroSI[i] = getMacroSample(macro[i]);
     atkInstMap[i] = 0;
-    if (macroSI[i].setNoteVal >= 0 && macroSI[i].atkLen > 0 && i + 64 < 128) {
-      atkInstMap[i] = i + 64 + 1;
-    }
+    if (macroSI[i].setNoteVal < 0 || macroSI[i].atkLen < 32 || i + 64 >= 128)
+      continue;
+    int as = macroSI[i].atkStart, al = macroSI[i].atkLen;
+    int ss = macroSI[i].start, sl = macroSI[i].len;
+    /* Overflow attack only for real short transients.  Loose rules used to put
+     * huge wrong slices on ch 9–10 (garbage / wrong timbre). */
+    const int MAX_ATK_BYTES = 8192;
+    if (al > MAX_ATK_BYTES)
+      continue;
+    if (as == ss && al >= sl)
+      continue; /* not shorter than sustain — no separate click */
+    if (as == ss && al * 4 > sl * 3)
+      continue; /* attack > ~75% of sustain: treat as false positive */
+    if (as != ss && al > sl && sl >= 256)
+      continue; /* attack block longer than sustain body — bogus */
+    atkInstMap[i] = i + 64 + 1;
   }
 
   /* Track which stereo side each instrument plays on so we can bake the
@@ -918,13 +931,12 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                     else     instPlayLeft[item.ins]++;
                   }
 
-                  /* Multi-phase attack: if this macro has mSetNote before mOn,
-                   * emit the fixed-pitch attack transient on an overflow channel.
-                   * The attack instrument is a one-shot sample that plays at the
-                   * mSetNote frequency, independent of the pattern note. */
+                  /* Multi-phase attack: mSetNote-before-mOn → one-shot on overflow.
+                   * Only four overflow columns (XM 9–12): Amiga ch 0–3.  Ch 4–7 keep
+                   * sustain-only on the main column (no extra XM channels). */
                   int macIdx = item.ins;
                   if (macIdx >= 0 && macIdx < 128 && atkInstMap[macIdx] > 0 &&
-                      ch < OVERFLOW_CHANS) {
+                      ch >= 0 && ch < OVERFLOW_CHANS) {
                     int ovfCh = BASE_CHANS + ch;
                     int atkNote = macroSI[macIdx].setNoteVal + 25;
                     if (atkNote >= 1 && atkNote <= 96) {
@@ -964,7 +976,11 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
       if (totalXmRows < MAX_TOTAL_ROWS && !rowDone) {
         for (int c = 0; c < BASE_CHANS; c++) {
           if (!chanEnv[c].active) continue;
-          for (int fr = 0; fr < xmSpeed && chanEnv[c].active; fr++) {
+          /* ~¾ pattern-tick rate: full xmSpeed made pEnve hits reach target too fast */
+          int envFrames = (xmSpeed * 2 + 2) / 3; /* ~⅔ tick — etwas langsamer als ¾ */
+          if (envFrames < 1) envFrames = 1;
+          if (envFrames > xmSpeed) envFrames = xmSpeed;
+          for (int fr = 0; fr < envFrames && chanEnv[c].active; fr++) {
             if (--chanEnv[c].timeC <= 0) {
               chanEnv[c].timeC = chanEnv[c].timeReset;
               if (chanEnv[c].vol < chanEnv[c].target)
@@ -988,7 +1004,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
            * decayed note — producing audible "ghost" tones. */
           {
             bool hasRecentNote = false;
-            int lookback = 10;
+            int lookback = 32;
             for (int back = 0; back <= lookback && (totalXmRows - back) >= 0; back++) {
               XMCell* prev = &bigGrid[(totalXmRows - back) * numChans + c];
               if (prev->note > 0 && prev->note < 97 && prev->inst > 0) {
@@ -1008,6 +1024,11 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
             int slideTicks = (xmSpeed > 1) ? (xmSpeed - 1) : 1;
             if (delta > 0) {
               int speed = (delta + slideTicks - 1) / slideTicks;
+              const int minRows = 7;
+              if (delta > slideTicks * 2 && speed > 1) {
+                int cap = (delta + minRows * slideTicks - 1) / (minRows * slideTicks);
+                if (cap >= 1 && cap < speed) speed = cap;
+              }
               if (speed >= 1 && speed <= 15) {
                 cell->vol = (unsigned char)(0x60 + speed);
                 lastEnveVol[c] -= speed * slideTicks;
@@ -1138,7 +1159,8 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
            * same despite the boosted initial volume. */
           envSlide = ef.sustainSlide;
           if (envSlide != 0 && effVol > 0) {
-            int s = abs(envSlide) * scaledEV / effVol;
+            /* Slower slides (~½): fades were ending audibly too soon vs TFMX. */
+            int s = (abs(envSlide) * scaledEV * 2 + effVol * 5 - 1) / (effVol * 5);
             if (s < 1) s = 1;
             if (s > 15) s = 15;
             envSlide = (envSlide < 0) ? -s : s;
@@ -1146,7 +1168,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
           envDelayLeft = ef.sustainDelay;
           releaseSlide = ef.releaseSlide;
           if (releaseSlide != 0 && effVol > 0) {
-            int s = abs(releaseSlide) * scaledEV / effVol;
+            int s = (abs(releaseSlide) * scaledEV * 2 + effVol * 5 - 1) / (effVol * 5);
             if (s < 1) s = 1;
             if (s > 15) s = 15;
             releaseSlide = (releaseSlide < 0) ? -s : s;
