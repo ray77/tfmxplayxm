@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #ifndef _WIN32
 #include <arpa/inet.h>
 #endif
@@ -55,6 +56,29 @@ static unsigned int ntohl_win(unsigned int x) {
 #define ntohs ntohs_win
 #define ntohl ntohl_win
 #endif
+
+/*
+ * Scale a linear TFMX volume (0-64) for XM output using a sqrt curve.
+ *
+ * The TFMX player applies a 2x amplitude boost and crossfeed in its audio
+ * output path that XM trackers don't replicate.  Additionally, with 12 XM
+ * channels vs 4 Amiga channels, each channel contributes proportionally less
+ * to the mix.  A sqrt curve compensates by boosting quieter volumes more than
+ * loud ones, preserving the perceived dynamic balance — especially important
+ * for pEnve fades where target volumes like 12/64 would otherwise sound far
+ * too quiet relative to attack levels.
+ *
+ * Mapping examples:  0→0, 12→28, 35→47, 48→55, 64→64
+ */
+static int scaleVol(int v) {
+  if (v <= 0) return 0;
+  if (v >= 64) return 64;
+  double scaled = sqrt((double)v / 64.0) * 64.0;
+  int result = (int)(scaled + 0.5);
+  if (result > 64) result = 64;
+  if (result < 1) result = 1;
+  return result;
+}
 
 /* XM uses little-endian byte order throughout */
 static void writeU16(FILE* f, unsigned short v) {
@@ -598,24 +622,19 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     int vol;       /* current volume (0-64), initialized from effective note volume */
   };
   ChanEnv chanEnv[8];
-  for (int c = 0; c < 8; c++) chanEnv[c].active = false;
+  bool chanAlive[8];
+  int lastEnveVol[8]; /* last scaled volume written by pEnve, for computing slides */
+  for (int c = 0; c < 8; c++) {
+    chanEnv[c].active = false;
+    chanAlive[c] = false;
+    lastEnveVol[c] = 0;
+  }
 
   int totalXmRows = 0;
   int ordRowToXmRow[128];
   memset(ordRowToXmRow, -1, sizeof(ordRowToXmRow));
   int loopJumpXmRow = -1;
   int loopJumpTargetXmRow = -1;
-
-  /* Set initial Amiga stereo panning (XM effect 8xx).
-   * Classic Amiga panning pattern: L,R,R,L,L,R,R,L  (channels 0-7).
-   * Overflow channels (8+) mirror the panning of the original channel
-   * they serve (overflow ch N+8 matches ch N). */
-  for (int ch = 0; ch < numChans; ch++) {
-    int srcCh = (ch >= BASE_CHANS) ? (ch - BASE_CHANS) : ch;
-    bool isRight = (srcCh & 1) ^ ((srcCh & 2) >> 1);
-    bigGrid[ch].fx = 8;
-    bigGrid[ch].param = isRight ? 0xD0 : 0x30;
-  }
 
   /* TFMX speed = ticks per row. The header stores (speed - 1). */
   int xmSpeed = head.songSpeed[subsong] + 1;
@@ -642,6 +661,13 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     }
   }
 
+  /* Track which stereo side each instrument plays on so we can bake the
+   * panning into the sample header, freeing the effect column for E9x etc. */
+  int instPlayLeft[128];
+  int instPlayRight[128];
+  memset(instPlayLeft, 0, sizeof(instPlayLeft));
+  memset(instPlayRight, 0, sizeof(instPlayRight));
+
   int startRow = head.songStart[subsong];
   int endRow = head.songEnd[subsong];
   if (startRow < 0) startRow = 0;
@@ -662,6 +688,8 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
         int ch = track[ordRow][t].trans;
         if (ch >= 0 && ch < BASE_CHANS && totalXmRows < MAX_TOTAL_ROWS) {
           bigGrid[totalXmRows * numChans + ch].vol = 0x10;
+          chanAlive[ch] = false;
+          lastEnveVol[ch] = 0;
         }
         ts[t].baseOff = -1;
         ts[t].tim = 0x7fffffff;
@@ -880,6 +908,15 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                     chanEnv[ch].vol = v * 4;
                   }
                   chanEnv[ch].active = false;
+                  chanAlive[ch] = true;
+                  lastEnveVol[ch] = scaleVol(chanEnv[ch].vol);
+
+                  /* Track stereo side for sample-header panning */
+                  if (item.ins >= 0 && item.ins < 128) {
+                    bool isR = (ch & 1) ^ ((ch & 2) >> 1);
+                    if (isR) instPlayRight[item.ins]++;
+                    else     instPlayLeft[item.ins]++;
+                  }
 
                   /* Multi-phase attack: if this macro has mSetNote before mOn,
                    * emit the fixed-pitch attack transient on an overflow channel.
@@ -895,6 +932,12 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                       atkCell->note = (unsigned char)atkNote;
                       atkCell->inst = (unsigned char)atkInstMap[macIdx];
                       atkCell->vol  = cell->vol;
+                      int atkIdx = atkInstMap[macIdx] - 1;
+                      if (atkIdx >= 0 && atkIdx < 128) {
+                        bool isR = (ch & 1) ^ ((ch & 2) >> 1);
+                        if (isR) instPlayRight[atkIdx]++;
+                        else     instPlayLeft[atkIdx]++;
+                      }
                     }
                   }
                 }
@@ -930,16 +973,61 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
               else if (chanEnv[c].vol > chanEnv[c].target)
                 chanEnv[c].vol = (chanEnv[c].vol - chanEnv[c].amt > chanEnv[c].target)
                                   ? chanEnv[c].vol - chanEnv[c].amt : chanEnv[c].target;
-              if (chanEnv[c].vol == chanEnv[c].target)
+              if (chanEnv[c].vol == chanEnv[c].target) {
                 chanEnv[c].active = false;
+                if (chanEnv[c].target == 0)
+                  chanAlive[c] = false;
+              }
             }
+          }
+          /* Only write pEnve volumes if a note was placed on this channel
+           * recently. In TFMX every pEnve cycle is preceded by a note, but
+           * some notes are lost in conversion (e.g. when a track redirects
+           * via pPPat and the note timing doesn't align with our XM grid).
+           * Without this check, the pEnve would raise the volume of an old,
+           * decayed note — producing audible "ghost" tones. */
+          {
+            bool hasRecentNote = false;
+            int lookback = 10;
+            for (int back = 0; back <= lookback && (totalXmRows - back) >= 0; back++) {
+              XMCell* prev = &bigGrid[(totalXmRows - back) * numChans + c];
+              if (prev->note > 0 && prev->note < 97 && prev->inst > 0) {
+                hasRecentNote = true;
+                break;
+              }
+            }
+            if (!hasRecentNote) continue;
           }
           XMCell* cell = &bigGrid[totalXmRows * numChans + c];
           if (cell->note == 0 && cell->inst == 0 && cell->vol == 0) {
             int v = chanEnv[c].vol;
             if (v < 0) v = 0;
             if (v > 64) v = 64;
-            cell->vol = (unsigned char)(0x10 + v);
+            int newScaled = scaleVol(v);
+            int delta = lastEnveVol[c] - newScaled;
+            int slideTicks = (xmSpeed > 1) ? (xmSpeed - 1) : 1;
+            if (delta > 0) {
+              int speed = (delta + slideTicks - 1) / slideTicks;
+              if (speed >= 1 && speed <= 15) {
+                cell->vol = (unsigned char)(0x60 + speed);
+                lastEnveVol[c] -= speed * slideTicks;
+                if (lastEnveVol[c] < 0) lastEnveVol[c] = 0;
+              } else {
+                cell->vol = (unsigned char)(0x10 + newScaled);
+                lastEnveVol[c] = newScaled;
+              }
+            } else if (delta < 0) {
+              int speed = ((-delta) + slideTicks - 1) / slideTicks;
+              if (speed >= 1 && speed <= 15) {
+                cell->vol = (unsigned char)(0x70 + speed);
+                lastEnveVol[c] += speed * slideTicks;
+                if (lastEnveVol[c] > 64) lastEnveVol[c] = 64;
+              } else {
+                cell->vol = (unsigned char)(0x10 + newScaled);
+                lastEnveVol[c] = newScaled;
+              }
+            }
+            /* delta == 0: no change needed, leave cell empty */
           }
         }
       }
@@ -949,23 +1037,26 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   }
   if (totalXmRows < 1) totalXmRows = 1;
 
-  if (loopJumpXmRow >= 0 && loopJumpTargetXmRow >= 0) {
-    int srcRow = loopJumpXmRow;
-    int dstPat = loopJumpTargetXmRow / ROWS_PER_PAT;
-    int dstRow = loopJumpTargetXmRow % ROWS_PER_PAT;
-    if (srcRow < MAX_TOTAL_ROWS) {
-      XMCell* cell = &bigGrid[srcRow * numChans + 0];
-      if (cell->fx == 0 && cell->param == 0) {
-        cell->fx = 0x0B;
-        cell->param = (unsigned char)dstPat;
-      }
-      if (dstRow > 0) {
-        XMCell* cell2 = &bigGrid[srcRow * numChans + 1];
-        if (cell2->fx == 0 && cell2->param == 0) {
-          cell2->fx = 0x0D;
-          cell2->param = (unsigned char)dstRow;
-        }
-      }
+  /* Compute per-instrument sample panning from the tracked channel usage.
+   * If an instrument always plays on same-panning channels (all-left or
+   * all-right), we bake the panning into the sample header so XM sets it
+   * on note trigger.  This frees the effect column for E9x, 0xy, etc.
+   * Mixed instruments (played on both sides) fall back to 8xx per note. */
+  unsigned char instSamplePan[128];
+  bool instNeedsPanFx[128];
+  for (int i = 0; i < 128; i++) {
+    if (instPlayRight[i] > 0 && instPlayLeft[i] == 0) {
+      instSamplePan[i] = 0xD0;
+      instNeedsPanFx[i] = false;
+    } else if (instPlayLeft[i] > 0 && instPlayRight[i] == 0) {
+      instSamplePan[i] = 0x30;
+      instNeedsPanFx[i] = false;
+    } else if (instPlayLeft[i] > 0 && instPlayRight[i] > 0) {
+      instSamplePan[i] = 128;
+      instNeedsPanFx[i] = true;
+    } else {
+      instSamplePan[i] = 128;
+      instNeedsPanFx[i] = false;
     }
   }
 
@@ -974,8 +1065,8 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
    *
    * During simulation, cells were written with raw pattern volumes. Now we:
    *   1. Apply effective volumes (mAddVol/mSetVol from macros)
-   *   2. Set per-note stereo panning (XM effect 8xx on every note row)
-   *   3. Schedule vibrato (XM effect 4xy, delayed by 1 row for panning)
+   *   2. Set stereo panning (8xx) only for mixed-side instruments
+   *   3. Place vibrato (4xy) directly on note rows when possible
    *   4. Apply sustain/release envelope fades (XM volume column 6x/7x)
    *   5. Convert pKeyUp (note 97) to release envelope triggers
    * =================================================================== */
@@ -1013,29 +1104,53 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
           else                        effVol = patVol * 3;
           if (effVol > 64) effVol = 64;
           if (effVol < 0) effVol = 0;
-          cell->vol = (unsigned char)(0x10 + effVol);
-          runningVol = effVol;
+          int scaledEV = scaleVol(effVol);
+          cell->vol = (unsigned char)(0x10 + scaledEV);
+          runningVol = scaledEV;
 
-          /* Panning on every note row ensures stereo is maintained even if
-           * the tracker resets panning on new notes. */
-          cell->fx = 8;
-          cell->param = panParam;
+          /* Panning: only needed for instruments that play on both stereo
+           * sides.  For single-side instruments, the sample header provides
+           * the correct panning on note trigger automatically. */
+          if (instNeedsPanFx[idx]) {
+            cell->fx = 8;
+            cell->param = panParam;
+          }
 
-          /* Schedule vibrato for the NEXT empty row (since the effect column
-           * is used for panning on the note row itself). */
+          /* Vibrato: place directly on the note row when the effect column
+           * is free.  If panning already occupies it, defer to the next row. */
           if (ef.vibSpeed > 0 && ef.vibDepth > 0) {
-            vibPending = true;
-            vibActive = true;
             curVibS = ef.vibSpeed; curVibD = ef.vibDepth;
+            if (cell->fx == 0) {
+              cell->fx = 4;
+              cell->param = (unsigned char)((curVibS << 4) | curVibD);
+              vibPending = false;
+            } else {
+              vibPending = true;
+            }
+            vibActive = true;
           } else {
             vibActive = false;
             vibPending = false;
           }
 
-          /* Set up sustain and release envelope state for this note */
+          /* Set up sustain and release envelope state for this note.
+           * Scale slide speed proportionally so release duration stays the
+           * same despite the boosted initial volume. */
           envSlide = ef.sustainSlide;
+          if (envSlide != 0 && effVol > 0) {
+            int s = abs(envSlide) * scaledEV / effVol;
+            if (s < 1) s = 1;
+            if (s > 15) s = 15;
+            envSlide = (envSlide < 0) ? -s : s;
+          }
           envDelayLeft = ef.sustainDelay;
           releaseSlide = ef.releaseSlide;
+          if (releaseSlide != 0 && effVol > 0) {
+            int s = abs(releaseSlide) * scaledEV / effVol;
+            if (s < 1) s = 1;
+            if (s > 15) s = 15;
+            releaseSlide = (releaseSlide < 0) ? -s : s;
+          }
           inRelease = false;
         }
       } else if (cell->note == 97) {
@@ -1095,6 +1210,49 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     }
   }
 
+  /* Place song loop (Bxx/Dxx) AFTER Phase 2 so panning/vibrato effects
+   * don't overwrite the jump command. */
+  if (loopJumpXmRow >= 0 && loopJumpTargetXmRow >= 0) {
+    int srcRow = loopJumpXmRow;
+    int dstPat = loopJumpTargetXmRow / ROWS_PER_PAT;
+    int dstRow = loopJumpTargetXmRow % ROWS_PER_PAT;
+    if (srcRow < MAX_TOTAL_ROWS) {
+      bool placedB = false;
+      for (int ch = 0; ch < numChans && !placedB; ch++) {
+        XMCell* cell = &bigGrid[srcRow * numChans + ch];
+        if (cell->fx == 0 && cell->param == 0) {
+          cell->fx = 0x0B;
+          cell->param = (unsigned char)dstPat;
+          placedB = true;
+        }
+      }
+      if (!placedB) {
+        XMCell* cell = &bigGrid[srcRow * numChans + 0];
+        cell->fx = 0x0B;
+        cell->param = (unsigned char)dstPat;
+      }
+
+      if (dstRow > 0) {
+        /* XM's Dxx uses BCD encoding: D32 = row 32, not D20 */
+        unsigned char dstRowBCD = (unsigned char)(((dstRow / 10) << 4) | (dstRow % 10));
+        bool placedD = false;
+        for (int ch = 0; ch < numChans && !placedD; ch++) {
+          XMCell* cell = &bigGrid[srcRow * numChans + ch];
+          if (cell->fx == 0 && cell->param == 0) {
+            cell->fx = 0x0D;
+            cell->param = dstRowBCD;
+            placedD = true;
+          }
+        }
+        if (!placedD) {
+          XMCell* cell = &bigGrid[srcRow * numChans + 1];
+          cell->fx = 0x0D;
+          cell->param = dstRowBCD;
+        }
+      }
+    }
+  }
+
   /* ===================================================================
    * PHASE 3: Write the XM file.
    * =================================================================== */
@@ -1110,7 +1268,9 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
 
   /* XM header fields (at offset 60, inside the 276-byte header block) */
   writeU16(out, (unsigned short)songLen);  /* song length in patterns */
-  writeU16(out, 0);                        /* restart position */
+  int restartPos = (loopJumpTargetXmRow >= 0)
+                   ? loopJumpTargetXmRow / ROWS_PER_PAT : 0;
+  writeU16(out, (unsigned short)restartPos); /* restart position */
   writeU16(out, (unsigned short)numChans);  /* number of channels */
   writeU16(out, (unsigned short)numPatterns);
   writeU16(out, 128);                      /* number of instruments */
@@ -1251,7 +1411,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     fputc(64, out);                           /* default volume (64 = max) */
     fputc(0, out);                            /* finetune (signed, 0 = none) */
     fputc(loopType, out);                     /* 0=none, 1=forward, 2=ping-pong */
-    fputc(128, out);                          /* panning (128 = center) */
+    fputc(instSamplePan[inst], out);           /* panning from tracked channel usage */
     fputc((unsigned char)relNote, out);       /* relative note */
     fputc(0, out);                            /* reserved / encoding (0 = delta) */
     memset(instName, 0, 22);
