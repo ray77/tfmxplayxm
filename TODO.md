@@ -1,5 +1,6 @@
 # to-do
 
+tildearrow:
 - accurate dual vibratos
 - fix the wall again
   - broken AddBegin timing...
@@ -21,3 +22,8 @@
 - tempo
 - song fading
 - lots of other things
+
+ray77:
+- TFMX 7v support in convert2xm
+- improved detection of instruments and macros
+- fixes for tfmxplay itself. The converter is almost more extensive than the player. 
