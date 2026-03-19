@@ -2,3 +2,4 @@
 	path = SDL
 	url = https://github.com/spurious/SDL-mirror
 	branch = release-2.0.12
+# Do we still need the file?
