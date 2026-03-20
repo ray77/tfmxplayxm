@@ -42,7 +42,7 @@
 #include "tfmx.h"
 
 #ifndef TFMXPLAY_VERSION
-#define TFMXPLAY_VERSION "0.0.4"
+#define TFMXPLAY_VERSION "0.0.5"
 #endif
 
 /* Win32 lacks arpa/inet.h — provide byte-swap helpers for big-endian TFMX data */
@@ -110,6 +110,8 @@ struct MacroSampleInfo {
   int sweepAmt;    /* mAddBegin: bytes per frame to shift loop start (0=none) */
   int sweepFrames; /* frames of sweep before mOneShot/mStop */
   int sweepHalfPeriod; /* data[0] from mAddBegin: frames per ping-pong half-cycle */
+  int sweepAmt2;   /* second mAddBegin amount (0=none); enables forward-backward trajectory */
+  int sweepReverseFrame; /* frame index where sweep direction changes to sweepAmt2 */
 };
 
 /*
@@ -132,12 +134,14 @@ struct MacroEffectInfo {
   int setVol;         /* mSetVol data[2] absolute volume; -1 = not present */
   int vibSpeed;       /* XM vibrato speed (effect 4, high nibble); 0 = off */
   int vibDepth;       /* XM vibrato depth (effect 4, low nibble) */
+  bool vibAfterRelease; /* true if vibrato only appears after mWaitUp (release vibrato) */
   int sustainSlide;   /* volume slide per row during sustain; negative = down */
   int sustainDelay;   /* rows to wait before sustain slide begins (from mWait) */
   int sustainTarget;  /* TFMX envelope target vol (0-64); slide stops here */
   int releaseSlide;   /* volume slide per row after pKeyUp; negative = down */
   int releaseTarget;  /* volume where first release stage stops (0 = fade to 0) */
   int releaseSlide2;  /* second release stage: slide from releaseTarget to 0 */
+  bool autoRelease;   /* true if release should auto-start when sustain target reached (two-stage sustain before mWaitUp) */
   int stutterOnFrames;  /* frames of sound per stutter cycle; 0 = no stutter */
   int stutterOffFrames; /* frames of silence per stutter cycle */
   int stutterVol;       /* volume during the "on" phase of stutter (0-64) */
@@ -156,7 +160,7 @@ struct MacroEffectInfo {
  * that the listener perceives as the instrument's timbre.
  */
 static MacroSampleInfo getMacroSample(const TFMXMacroData macro[256]) {
-  MacroSampleInfo info = { 0, 512, 0, 0, false, false, 0, -1, 0, -1, 0, 0, 0 };
+  MacroSampleInfo info = { 0, 512, 0, 0, false, false, 0, -1, 0, -1, 0, 0, 0, 0, 0 };
   int curStart = 0;
   int curLenWords = 256;   /* TFMX lengths are in 16-bit words */
   bool gotAny = false;
@@ -165,8 +169,11 @@ static MacroSampleInfo getMacroSample(const TFMXMacroData macro[256]) {
   bool afterOn = false;
   int preOnSetNote = -1;   /* mSetNote value found before mOn */
   bool gotAddBegin = false;
+  bool afterWaitUp = false;
 
   int onStart = 0, onLen = 512;
+  int firstOnStart = 0, firstOnLen = 512;
+  bool hadFirstOn = false;
   int postStart = -1, postLen = -1;
 
   for (int i = 0; i < 256; i++) {
@@ -174,18 +181,21 @@ static MacroSampleInfo getMacroSample(const TFMXMacroData macro[256]) {
       case mSetBegin:
         curStart = (macro[i].data[0]<<16)|(macro[i].data[1]<<8)|(macro[i].data[2]);
         if (afterOn && postStart < 0) postStart = curStart;
-        else if (afterOn) postStart = curStart;
         break;
       case mSetLen:
         curLenWords = (macro[i].data[1]<<8)|(macro[i].data[2]);
         if (curLenWords <= 0) curLenWords = 256;
         if (afterOn && postLen < 0) postLen = curLenWords;
-        else if (afterOn) postLen = curLenWords;
         break;
       case mSetNote:
         if (!afterOn) preOnSetNote = macro[i].data[0];
         break;
       case mOn:
+        if (!hadFirstOn) {
+          firstOnStart = curStart;
+          firstOnLen = curLenWords;
+          hadFirstOn = true;
+        }
         onStart = curStart;
         onLen = curLenWords;
         gotAny = true;
@@ -203,6 +213,13 @@ static MacroSampleInfo getMacroSample(const TFMXMacroData macro[256]) {
       case mOneShot:
         info.oneShot = true;
         break;
+      case mWaitUp:
+        afterWaitUp = true;
+        break;
+      case mLoopUp:
+        if (macro[i].data[0] == 0)
+          afterWaitUp = true;
+        break;
       case mAddNote: {
         int val = (signed char)macro[i].data[0];
         if (afterOn)
@@ -212,22 +229,68 @@ static MacroSampleInfo getMacroSample(const TFMXMacroData macro[256]) {
         break;
       }
       case mAddBegin:
-        if (afterOn && !gotAddBegin && macro[i].data[0] > 0) {
+        if (afterOn && !gotAddBegin && !afterWaitUp) {
           int amt = (signed short)((macro[i].data[1]<<8)|macro[i].data[2]);
           if (amt > 0) {
             info.sweepAmt = amt;
             int frames = 0;
+            bool hitInfiniteLoop = false;
             for (int j = i + 1; j < 256; j++) {
               if (macro[j].op == mWait) {
                 int w = (macro[j].data[0]<<16)|(macro[j].data[1]<<8)|macro[j].data[2];
                 frames += w + 1;
+              } else if (macro[j].op == mWaitSample) {
+                int w = macro[j].data[0];
+                frames += (w > 0) ? w : 1;
+              } else if (macro[j].op == mLoop) {
+                int loopCount = macro[j].data[0];
+                int loopTarget = macro[j].data[2];
+                if (loopCount > 0 && loopTarget < j) {
+                  int bodyFrames = 0;
+                  for (int k = loopTarget; k < j; k++) {
+                    if (macro[k].op == mWait) {
+                      int w = (macro[k].data[0]<<16)|(macro[k].data[1]<<8)|macro[k].data[2];
+                      bodyFrames += w + 1;
+                    } else if (macro[k].op == mWaitSample) {
+                      int w = macro[k].data[0];
+                      bodyFrames += (w > 0) ? w : 1;
+                    }
+                  }
+                  int alreadyCounted = 0;
+                  for (int k = (loopTarget > i + 1 ? loopTarget : i + 1); k < j; k++) {
+                    if (macro[k].op == mWait) {
+                      int w = (macro[k].data[0]<<16)|(macro[k].data[1]<<8)|macro[k].data[2];
+                      alreadyCounted += w + 1;
+                    } else if (macro[k].op == mWaitSample) {
+                      int w = macro[k].data[0];
+                      alreadyCounted += (w > 0) ? w : 1;
+                    }
+                  }
+                  frames -= alreadyCounted;
+                  frames += bodyFrames * loopCount;
+                } else if (loopCount == 0) {
+                  hitInfiniteLoop = true;
+                  break;
+                }
+              } else if (macro[j].op == mAddBegin && info.sweepAmt2 == 0) {
+                int amt2 = (signed short)((macro[j].data[1]<<8)|macro[j].data[2]);
+                if (amt2 != 0 && amt2 != amt) {
+                  info.sweepAmt2 = amt2;
+                  info.sweepReverseFrame = frames;
+                }
               } else if (macro[j].op == mOneShot || macro[j].op == mStop) {
                 break;
               }
             }
-            if (frames <= 0) frames = 40;
-            info.sweepFrames = frames;
-            info.sweepHalfPeriod = macro[i].data[0];
+            if (hitInfiniteLoop) {
+              info.sweepAmt = 0;
+              info.sweepAmt2 = 0;
+              info.sweepReverseFrame = 0;
+            } else {
+              if (frames <= 0) frames = 40;
+              info.sweepFrames = frames;
+              info.sweepHalfPeriod = macro[i].data[0];
+            }
           }
           gotAddBegin = true;
         }
@@ -245,10 +308,12 @@ done:
       info.len = postLen * 2;
       /* Multi-phase macro with mSetNote before mOn: the pre-mOn sample
        * plays at a fixed pitch on the Amiga hardware channel.  Store the
-       * attack info so the simulation can emit it on an overflow channel. */
+       * attack info so the simulation can emit it on an overflow channel.
+       * Use the FIRST mOn's sample, not the last (which may point to the
+       * body sample after a second mOn). */
       if (preOnSetNote >= 0) {
-        info.atkStart   = onStart;
-        info.atkLen     = onLen * 2;
+        info.atkStart   = firstOnStart;
+        info.atkLen     = firstOnLen * 2;
         info.setNoteVal = preOnSetNote;
       }
     } else {
@@ -296,27 +361,35 @@ static int calcEnvSpeed(int envAmt, int envTimeC, int xmSpeed) {
  *   mEnv after mWaitUp  → release envelope (triggered by pKeyUp)
  *   mWait              → sustain delay in rows
  *
- * For multi-phase macros, the LAST mAddVol/mSetVol wins, since commands after
- * mOn override the initial attack phase and represent the sustained sound.
+ * For multi-phase macros (e.g., loud attack then quiet sustain via mSetVol
+ * after mOn), the PRE-mOn volume command defines the note-on volume in XM.
+ * Post-mOn mSetVol/mAddVol only override when both are in the same phase.
  */
 static MacroEffectInfo getMacroEffects(const TFMXMacroData macro[256], int xmSpeed) {
-  MacroEffectInfo fx = {-999, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  MacroEffectInfo fx = {-999, -1, 0, 0, false, 0, 0, 0, 0, 0, 0, false, 0, 0, 0, 0, 0};
   bool foundVib = false;
   bool afterOn = false;
   bool afterWaitUp = false;
   bool foundSustainEnv = false;
   bool foundReleaseEnv = false;
   int waitBeforeFirstEnv = 0;
+  bool hasPreOnVol = false;
 
   for (int i = 0; i < 256; i++) {
     switch (macro[i].op) {
       case mAddVol:
-        fx.addVol = (signed char)macro[i].data[2];
-        fx.setVol = -1;
+        if (!afterWaitUp) {
+          fx.addVol = (signed char)macro[i].data[2];
+          fx.setVol = -1;
+          if (!afterOn) hasPreOnVol = true;
+        }
         break;
       case mSetVol:
-        fx.setVol = macro[i].data[2];
-        fx.addVol = -999;
+        if (!afterWaitUp) {
+          fx.setVol = macro[i].data[2];
+          fx.addVol = -999;
+          if (!afterOn) hasPreOnVol = true;
+        }
         break;
       case mOn:
         afterOn = true;
@@ -350,6 +423,7 @@ static MacroEffectInfo getMacroEffects(const TFMXMacroData macro[256], int xmSpe
             if (yd < 1) yd = 1; if (yd > 15) yd = 15;
             fx.vibSpeed = xs;
             fx.vibDepth = yd;
+            fx.vibAfterRelease = afterWaitUp;
           }
           foundVib = true;
         }
@@ -374,6 +448,15 @@ static MacroEffectInfo getMacroEffects(const TFMXMacroData macro[256], int xmSpe
             fx.sustainSlide = (envTarget > initVol) ? speed : -speed;
           }
           foundSustainEnv = true;
+        } else if (foundSustainEnv && !afterWaitUp && !foundReleaseEnv
+                   && envTarget == 0 && fx.sustainTarget > 0) {
+          /* Two-stage sustain: first stage fades to non-zero target,
+           * second stage continues to 0.  Store second stage as a release
+           * that auto-starts when the first target is reached. */
+          fx.releaseSlide = -speed;
+          fx.releaseTarget = 0;
+          fx.autoRelease = true;
+          foundReleaseEnv = true;
         } else if (afterWaitUp && !foundReleaseEnv) {
           /* First release envelope (may target a non-zero volume) */
           fx.releaseTarget = envTarget;
@@ -540,7 +623,7 @@ static unsigned int readBE32(const unsigned char* buf, int off) {
  *                  multiple songs, each with its own start/end order row and speed
  */
 bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath, int subsong) {
-  printf("XM-Export: converting -> %s\n", outPath);
+  int xmErrors = 0;
   FILE* f;
   TFMXHeader head;
   int patPoint[128], macroPoint[128];
@@ -679,8 +762,12 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
       if (cmd == 3) { multimode = true; break; }
     }
   }
-  if (multimode)
-    fprintf(stderr, "  TFMX 7V (multimode) detected\n");
+  (void)multimode; /* detection logged in summary line */
+
+  auto volMap = [&](int v) -> int {
+    (void)multimode;
+    return v;
+  };
 
   /* Open output XM */
   FILE* out = fopen(outPath, "wb");
@@ -796,45 +883,125 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   int eClocks = 14318;
   int xmBPM   = 125;
 
+  /* Pre-scan order table for EFFE speed changes that occur before any
+   * pattern data.  This ensures macroFX envelope calculations use the
+   * actual playback speed rather than the (potentially placeholder) header value. */
+  for (int r = startRow; r <= endRow; r++) {
+    if (track[r][0].pat == 0xEF && track[r][0].trans == 0xFE) {
+      int cmd = (track[r][1].pat << 8) | track[r][1].trans;
+      if (cmd == 2) {
+        int w2 = (track[r][2].pat << 8) | track[r][2].trans;
+        int newSpeed = (w2 & 0xFF) + 1;
+        if (newSpeed >= 1 && newSpeed <= 31) xmSpeed = newSpeed;
+      }
+    } else {
+      break;
+    }
+  }
+
+  /* XM volume slides need at least 2 ticks per row (tick 0 = set,
+   * ticks 1..N = slide).  If the TFMX song uses speed 0 (= every VBL),
+   * bump to speed 2 and double BPM to keep the same playback rate.
+   * Track the doubling so that later CIA/EFFE BPM overrides are also doubled. */
+  bool speedWasDoubled = false;
+  if (xmSpeed == 1) {
+    xmSpeed = 2;
+    xmBPM = 250;
+    speedWasDoubled = true;
+  }
+
+  /* Resolve mCont chains: if a macro's first action is mCont(target),
+   * the effective macro is the target. Build a redirect table so that
+   * sample info, effects, and hasOn checks use the resolved macro. */
+  int macroContTarget[128];
+  /* mSKey (split keyboard): stores split note and alternate target.
+   * When a macro starts with mSKey, notes >= sKeySplit use sKeyHigh target;
+   * lower notes use the default macroContTarget (sKeyLow). */
+  int sKeySplit[128];
+  int sKeyLow[128];
+  int sKeyHigh[128];
+  for (int i = 0; i < 128; i++) {
+    macroContTarget[i] = -1;
+    sKeySplit[i] = -1;
+    sKeyLow[i] = -1;
+    sKeyHigh[i] = -1;
+    int skeyOffset = 0;
+    bool hasSKey = false;
+    for (int j = 0; j < 256; j++) {
+      if (macro[i][j].op == mSKey) {
+        sKeySplit[i] = macro[i][j].data[0];
+        skeyOffset = macro[i][j].data[2];
+        hasSKey = true;
+        continue;
+      }
+      if (macro[i][j].op == mCont) {
+        int target = macro[i][j].data[0];
+        if (target >= 0 && target < 128 && target != i) {
+          if (hasSKey && sKeyLow[i] < 0) {
+            sKeyLow[i] = target;
+            macroContTarget[i] = target;
+            if (skeyOffset <= 1) {
+              sKeyHigh[i] = target;
+            }
+          } else if (hasSKey && sKeyHigh[i] < 0) {
+            sKeyHigh[i] = target;
+          } else {
+            macroContTarget[i] = target;
+          }
+        }
+        if (!hasSKey) break;
+        continue;
+      }
+      if (macro[i][j].op == mOn || macro[i][j].op == mStop) break;
+    }
+  }
+
   /* Pre-compute macro effects for all 128 instruments.
    * Needed before simulation so pEnve can initialize chanEnv.vol to the
-   * correct effective volume (accounting for mAddVol/mSetVol). */
+   * correct effective volume (accounting for mAddVol/mSetVol).
+   * For mCont macros, use the target's effects but keep any pre-mCont
+   * volume/oneShot overrides from the source macro. */
   MacroEffectInfo macroFX[128];
   bool macroHasOn[128];
   for (int i = 0; i < 128; i++) {
-    macroFX[i] = getMacroEffects(macro[i], xmSpeed);
+    int resolved = (macroContTarget[i] >= 0) ? macroContTarget[i] : i;
+    macroFX[i] = getMacroEffects(macro[resolved], xmSpeed);
+    /* Merge pre-mCont overrides (e.g. mAddVol before mCont) */
+    if (macroContTarget[i] >= 0) {
+      for (int j = 0; j < 256; j++) {
+        if (macro[i][j].op == mAddVol)
+          macroFX[i].addVol = (signed char)macro[i][j].data[2];
+        else if (macro[i][j].op == mSetVol)
+          macroFX[i].setVol = macro[i][j].data[2];
+        else if (macro[i][j].op == mCont) break;
+        else if (macro[i][j].op == mStop) break;
+      }
+    }
     macroHasOn[i] = false;
     for (int j = 0; j < 256; j++) {
-      if (macro[i][j].op == mOn) { macroHasOn[i] = true; break; }
-      if (macro[i][j].op == mStop) break;
+      if (macro[resolved][j].op == mOn) { macroHasOn[i] = true; break; }
+      if (macro[resolved][j].op == mStop) break;
     }
   }
 
   /* Pre-compute sample info for all macros (needed for attack overflow).
    * For macros with mSetNote before mOn, the pre-mOn sample is a fixed-pitch
    * attack transient.  We map each such macro to an attack XM instrument
-   * stored in the upper instrument slots (macro + 65). */
+   * stored in the upper instrument slots (macro + 65).
+   * For mCont macros, use the resolved target's sample info. */
   MacroSampleInfo macroSI[128];
   int atkInstMap[128];  /* atkInstMap[m] = XM instrument number (1-based) for attack; 0 = none */
   for (int i = 0; i < 128; i++) {
-    macroSI[i] = getMacroSample(macro[i]);
-    /* Debug: dump macro info for instruments with mOn */
-    if (macroHasOn[i]) {
-      MacroEffectInfo& ef = macroFX[i];
-      MacroSampleInfo& si = macroSI[i];
-      fprintf(stderr, "M%03d: smpStart=%d len=%d oneShot=%d sweepAmt=%d sweepFrames=%d "
-              "addNote=%d sustainSlide=%d sustainTarget=%d releaseSlide=%d "
-              "addVol=%d setVol=%d | opcodes:",
-              i, si.start, si.len, si.oneShot, si.sweepAmt, si.sweepFrames,
-              si.addNote, ef.sustainSlide, ef.sustainTarget, ef.releaseSlide,
-              ef.addVol, ef.setVol);
-      for (int j = 0; j < 20; j++) {
-        if (macro[i][j].op == mStop) { fprintf(stderr, " %d:STOP", j); break; }
-        fprintf(stderr, " %d:%d(%02x%02x%02x)", j, macro[i][j].op,
-                macro[i][j].data[0], macro[i][j].data[1], macro[i][j].data[2]);
+    int resolved = (macroContTarget[i] >= 0) ? macroContTarget[i] : i;
+    macroSI[i] = getMacroSample(macro[resolved]);
+    /* mOneShot in source macro overrides oneShot flag */
+    if (macroContTarget[i] >= 0) {
+      for (int j = 0; j < 256; j++) {
+        if (macro[i][j].op == mOneShot) { macroSI[i].oneShot = true; break; }
+        if (macro[i][j].op == mCont || macro[i][j].op == mStop) break;
       }
-      fprintf(stderr, "\n");
     }
+    (void)macroFX[i];
     atkInstMap[i] = 0;
     if (macroSI[i].setNoteVal < 0 || macroSI[i].atkLen < 32 || i + 64 >= 128)
       continue;
@@ -888,6 +1055,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   auto initOrderRow = [&](int ordRow) {
     for (int t = 0; t < 8; t++) {
       unsigned char p = track[ordRow][t].pat;
+      ts[t].trans = (signed char)track[ordRow][t].trans;
       if (p == 0x80) continue;
       if (p == 0xFE) {
         int ch = track[ordRow][t].trans;
@@ -906,7 +1074,6 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
         continue;
       }
       ts[t].baseOff = patPoint[p];
-      ts[t].trans = (signed char)track[ordRow][t].trans;
       ts[t].pos = -1;
       ts[t].tim = -1;
       ts[t].loopCount = 0;
@@ -938,6 +1105,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
       if (cmd == 2) {
         /* Speed change: w2 = new prescale (ticks-1 per row) */
         int newSpeed = (w2 & 0xFF) + 1;
+        if (newSpeed == 1) { newSpeed = 2; speedWasDoubled = true; }
         if (newSpeed >= 1 && newSpeed <= 31) {
           if (totalXmRows > 0 && newSpeed != xmSpeed) {
             XMCell* cell = &bigGrid[(totalXmRows - 1) * numChans];
@@ -946,11 +1114,13 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
             }
           }
           xmSpeed = newSpeed;
+          if (newSpeed > 2) speedWasDoubled = false;
         }
         /* Optional CIA override in w3 */
         if (!(w3 & 0xF200) && (w3 & 0x1FF) > 0xF) {
           eClocks = 0x1B51F8 / (w3 & 0x1FF);
           int newBPM = (int)(1790456.0 / eClocks + 0.5);
+          if (speedWasDoubled) newBPM *= 2;
           if (newBPM < 32) newBPM = 32; if (newBPM > 255) newBPM = 255;
           if (totalXmRows > 0 && newBPM != xmBPM) {
             XMCell* cell = &bigGrid[(totalXmRows - 1) * numChans];
@@ -968,6 +1138,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
           if (x < -0x20) x = -0x20;
           eClocks = (14318 * (x + 100)) / 100;
           int newBPM = (int)(1790456.0 / eClocks + 0.5);
+          if (speedWasDoubled) newBPM *= 2;
           if (newBPM < 32) newBPM = 32; if (newBPM > 255) newBPM = 255;
           if (totalXmRows > 0 && newBPM != xmBPM) {
             XMCell* cell = &bigGrid[(totalXmRows - 1) * numChans];
@@ -976,7 +1147,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
             }
           }
           xmBPM = newBPM;
-          fprintf(stderr, "  timeshare: x=%d eClocks=%d BPM=%d\n", x, eClocks, newBPM);
+          (void)x; /* timeshare detected */
         }
       }
       /* cmd == 4 (fade) is handled implicitly by per-channel volume envelopes */
@@ -1185,44 +1356,59 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                   XMCell* cell = &bigGrid[totalXmRows * numChans + ch];
 
                   
-                  bool emptyMacro = (item.ins >= 0 && item.ins < 128 &&
-                                     !macroHasOn[item.ins]);
-                  if (!emptyMacro) {
+                  /* mSKey: redirect instrument based on note vs split point */
+                  int effectiveIns = item.ins;
+                  if (effectiveIns >= 0 && effectiveIns < 128 &&
+                      sKeySplit[effectiveIns] >= 0) {
+                    int tfmxNote = item.note & 0x3f;
+                    if (tfmxNote >= sKeySplit[effectiveIns] &&
+                        sKeyHigh[effectiveIns] >= 0)
+                      effectiveIns = sKeyHigh[effectiveIns];
+                    else if (sKeyLow[effectiveIns] >= 0)
+                      effectiveIns = sKeyLow[effectiveIns];
+                  }
+                  bool emptyMacro = (effectiveIns >= 0 && effectiveIns < 128 &&
+                                     !macroHasOn[effectiveIns]);
+                  int useInst = effectiveIns;
+                  if (emptyMacro && chanLastMacro[ch] >= 0 &&
+                      chanLastMacro[ch] < 128 && macroHasOn[chanLastMacro[ch]])
+                    useInst = chanLastMacro[ch];
+                  if (!emptyMacro || useInst != item.ins) {
                     cell->note = (unsigned char)xmNote;
-                    cell->inst = (unsigned char)(item.ins + 1);
+                    cell->inst = (unsigned char)(useInst + 1);
                     int v = item.vol;
-                    cell->vol = (unsigned char)(0x10 + v * 4);
+                    int idx = useInst;
+                    int prelimVol = v * 4;
+                    if (prelimVol > 64) prelimVol = 64;
+                    cell->vol = (unsigned char)(0x10 + prelimVol);
                     if (cell->vol > 0x50) cell->vol = 0x50;
-                    int idx = item.ins;
+                    int effVol = prelimVol;
                     if (idx >= 0 && idx < 128) {
                       MacroEffectInfo& ef = macroFX[idx];
                       bool isSweep = (macroSI[idx].sweepAmt != 0);
-                      int effVol;
                       if (ef.setVol >= 0 && !isSweep) effVol = ef.setVol;
                       else if (ef.addVol != -999)     effVol = ef.addVol + v * 3;
                       else                             effVol = v * 3;
                       if (effVol > 64) effVol = 64;
                       if (effVol < 0) effVol = 0;
-                      chanEnv[ch].vol = effVol;
-                    } else {
-                      chanEnv[ch].vol = v * 4;
                     }
+                    chanEnv[ch].vol = effVol;
                     chanEnv[ch].active = false;
                     chanAlive[ch] = true;
                     chanPortaActive[ch] = false;
-                    chanLastMacro[ch] = item.ins;
-                    lastEnveVol[ch] = scaleVol(chanEnv[ch].vol);
+                    chanLastMacro[ch] = useInst;
+                    lastEnveVol[ch] = volMap(chanEnv[ch].vol);
 
-                    if (item.ins >= 0 && item.ins < 128) {
-                      bool isR = multimode ? (ch == 1 || ch == 2)
+                    if (useInst >= 0 && useInst < 128) {
+                      bool isR = multimode ? (ch==1||ch==2||ch==6||ch==7)
                                            : (bool)((ch & 1) ^ ((ch & 2) >> 1));
-                      if (isR) instPlayRight[item.ins]++;
-                      else     instPlayLeft[item.ins]++;
-                      if (instFirstXmNote[item.ins] < 0)
-                        instFirstXmNote[item.ins] = xmNote;
+                      if (isR) instPlayRight[useInst]++;
+                      else     instPlayLeft[useInst]++;
+                      if (instFirstXmNote[useInst] < 0)
+                        instFirstXmNote[useInst] = xmNote;
                     }
 
-                    int macIdx = item.ins;
+                    int macIdx = useInst;
                     if (macIdx >= 0 && macIdx < 128 && atkInstMap[macIdx] > 0 &&
                         ch >= 0 && ch < OVERFLOW_CHANS) {
                       int ovfCh = BASE_CHANS + ch;
@@ -1242,7 +1428,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                         atkCell->vol  = (unsigned char)(0x10 + v);
                         int atkIdx = atkInstMap[macIdx] - 1;
                         if (atkIdx >= 0 && atkIdx < 128) {
-                          bool isR = multimode ? (ch == 1 || ch == 2)
+                          bool isR = multimode ? (ch==1||ch==2||ch==6||ch==7)
                                                : (bool)((ch & 1) ^ ((ch & 2) >> 1));
                           if (isR) instPlayRight[atkIdx]++;
                           else     instPlayLeft[atkIdx]++;
@@ -1263,7 +1449,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                       cell->vol  = 0;
                       stutterUsed[ch] = true;
                       if (item.ins >= 0 && item.ins < 128) {
-                        bool isR = multimode ? (ch == 1 || ch == 2)
+                        bool isR = multimode ? (ch==1||ch==2||ch==6||ch==7)
                                              : (bool)((ch & 1) ^ ((ch & 2) >> 1));
                         if (isR) instPlayRight[item.ins]++;
                         else     instPlayLeft[item.ins]++;
@@ -1346,12 +1532,20 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
            * reaches target 0, so it accurately tracks whether an audible
            * sample is still playing — regardless of how many rows have
            * passed since the last note event. */
-          if (!chanAlive[c]) continue;
+          if (!chanAlive[c]) {
+            XMCell* cell = &bigGrid[totalXmRows * numChans + c];
+            if (cell->note == 0 && cell->inst == 0 && cell->vol == 0 &&
+                lastEnveVol[c] > 0) {
+              cell->vol = 0x10;
+              lastEnveVol[c] = 0;
+            }
+            continue;
+          }
           XMCell* cell = &bigGrid[totalXmRows * numChans + c];
           int v = chanEnv[c].vol;
           if (v < 0) v = 0;
           if (v > 64) v = 64;
-          int newScaled = scaleVol(v);
+          int newScaled = volMap(v);
           int delta = lastEnveVol[c] - newScaled;
           int slideTicks = (xmSpeed > 1) ? (xmSpeed - 1) : 1;
           if (cell->note == 0 && cell->inst == 0 && cell->vol == 0) {
@@ -1427,6 +1621,49 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     }
   }
 
+  /* 7V orphan-note cleanup: in multimode, notes that receive no events
+   * for a very long span are likely orphaned (the owning track moved on).
+   * Insert a key-up so Phase 2 can apply a natural release fade.
+   * Before inserting key-off, look ahead to see if the channel has a
+   * future note-on — if so, the note is intentionally sustained. */
+  if (multimode) {
+    const int ORPHAN_GAP = 96; /* ~1.5 XM patterns of total silence */
+    for (int c = 0; c < BASE_CHANS; c++) {
+      int lastEventRow = -1;
+      bool noteActive = false;
+      for (int row = 0; row < totalXmRows; row++) {
+        XMCell* cell = &bigGrid[row * numChans + c];
+        bool hasEvent = (cell->note > 0 || cell->inst > 0 ||
+                         cell->vol > 0  || cell->fx > 0 || cell->param > 0);
+        if (cell->note > 0 && cell->note < 97 && cell->inst > 0) {
+          noteActive = true;
+          lastEventRow = row;
+        } else if (cell->note == 97) {
+          noteActive = false;
+          lastEventRow = row;
+        } else if (hasEvent) {
+          lastEventRow = row;
+        } else if (noteActive && lastEventRow >= 0 &&
+                   (row - lastEventRow) == ORPHAN_GAP) {
+          bool hasFutureNote = false;
+          for (int frow = row + 1; frow < totalXmRows; frow++) {
+            XMCell* fc = &bigGrid[frow * numChans + c];
+            if (fc->note > 0 && fc->note < 97 && fc->inst > 0) {
+              hasFutureNote = true;
+              break;
+            }
+          }
+          if (hasFutureNote) {
+            lastEventRow = row;
+            continue;
+          }
+          cell->note = 97;
+          noteActive = false;
+        }
+      }
+    }
+  }
+
   /* ===================================================================
    * PHASE 2: Post-process the XM grid.
    *
@@ -1441,6 +1678,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   for (int ch = 0; ch < numChans; ch++) {
     bool vibActive = false;
     bool vibPending = false;
+    bool vibIsReleaseOnly = false;
     int envSlide = 0;
     int envDelayLeft = 0;
     int releaseSlide = 0;
@@ -1448,6 +1686,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     int releaseSlide2 = 0;
     bool inRelease = false;
     bool inRelease2 = false;
+    bool autoRelease = false;
     int sustainTargetVol = 0;
     int curVibS = 0, curVibD = 0;
     int runningVol = 0;
@@ -1457,10 +1696,14 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     int stutterFadeCycles = 0;
     int xmTicksPerRow = (xmSpeed > 1) ? (xmSpeed - 1) : 1;
     bool isRight;
-    if (multimode)
-      isRight = (ch == 1 || ch == 2);  /* 7V: ch 1,2 = RIGHT; 0,4-7 = LEFT */
-    else
+    if (multimode) {
+      /* 7V channelToVoiceMap: ch→voice = {0,1,2,7,3,4,5,6}
+       * voice→paula = voice & 3.  Paula 1,2 = RIGHT. */
+      static const int ch2paula[8] = {0,1,2,3,3,0,1,2};
+      isRight = (ch < 8) && (ch2paula[ch] == 1 || ch2paula[ch] == 2);
+    } else {
       isRight = (ch & 1) ^ ((ch & 2) >> 1);  /* Amiga standard: 0,3=L  1,2=R */
+    }
     unsigned char panParam = isRight ? 0xD0 : 0x30;
 
     for (int row = 0; row < totalXmRows; row++) {
@@ -1490,7 +1733,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
           else                             effVol = patVol * 3;
           if (effVol > 64) effVol = 64;
           if (effVol < 0) effVol = 0;
-          int scaledEV = scaleVol(effVol);
+          int scaledEV = volMap(effVol);
           cell->vol = (unsigned char)(0x10 + scaledEV);
           runningVol = scaledEV;
           /* Panning: write 8xx to effect column when free, so panning is
@@ -1503,9 +1746,11 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
           }
 
           /* Vibrato: place directly on the note row when the effect column
-           * is free.  If panning already occupies it, defer to the next row. */
-          if (ef.vibSpeed > 0 && ef.vibDepth > 0) {
-            curVibS = ef.vibSpeed; curVibD = ef.vibDepth;
+           * is free.  If panning already occupies it, defer to the next row.
+           * Release-only vibrato (vibAfterRelease) is deferred until pKeyUp. */
+          curVibS = ef.vibSpeed; curVibD = ef.vibDepth;
+          vibIsReleaseOnly = ef.vibAfterRelease;
+          if (ef.vibSpeed > 0 && ef.vibDepth > 0 && !ef.vibAfterRelease) {
             if (cell->fx == 0) {
               cell->fx = 4;
               cell->param = (unsigned char)((curVibS << 4) | curVibD);
@@ -1534,7 +1779,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
            * despite the boosted volume.  For fade-ins (effVol=0, slide>0),
            * scale against the target volume instead. */
           envSlide = ef.sustainSlide;
-          sustainTargetVol = scaleVol(ef.sustainTarget);
+          sustainTargetVol = volMap(ef.sustainTarget);
           if (envSlide != 0) {
             int refVol = effVol;
             int refScaled = scaledEV;
@@ -1551,7 +1796,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
           }
           envDelayLeft = ef.sustainDelay;
           releaseSlide = ef.releaseSlide;
-          releaseTargetVol = scaleVol(ef.releaseTarget);
+          releaseTargetVol = volMap(ef.releaseTarget);
           releaseSlide2 = ef.releaseSlide2;
           if (releaseSlide != 0 && effVol > 0) {
             int s = (abs(releaseSlide) * scaledEV + effVol / 2) / effVol;
@@ -1567,6 +1812,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
           }
           inRelease = false;
           inRelease2 = false;
+          autoRelease = ef.autoRelease;
 
           /* Set up stutter (mSetVol 0/N pulsing) */
           stutterOn = ef.stutterOnFrames;
@@ -1601,8 +1847,13 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
           envSlide = -s;
           inRelease = true;
         }
-        vibActive = false;
-        vibPending = false;
+        if (vibIsReleaseOnly && curVibS > 0 && curVibD > 0) {
+          vibActive = true;
+          vibPending = true;
+        } else {
+          vibActive = false;
+          vibPending = false;
+        }
       } else if (cell->note == 0 && cell->inst == 0) {
         /* --- Continuation row (no new note): apply ongoing effects --- */
 
@@ -1630,7 +1881,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
               if (pos >= stutterOff) onFrames++;
               stutterPhase++;
             }
-            int sv = scaleVol(stutterVol);
+            int sv = volMap(stutterVol);
             /* mAddBegin shifts sample start each cycle on a looping sample →
              * timbre changes slightly but volume stays essentially constant.
              * Model as a very gentle, asymptotic fade (never reaches zero). */
@@ -1685,6 +1936,10 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                 if (inRelease && !inRelease2 && releaseSlide2 != 0) {
                   envSlide = releaseSlide2;
                   inRelease2 = true;
+                } else if (!inRelease && autoRelease && releaseSlide != 0) {
+                  envSlide = releaseSlide;
+                  sustainTargetVol = releaseTargetVol;
+                  inRelease = true;
                 } else {
                   envSlide = 0;
                 }
@@ -1705,6 +1960,10 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
             if (inRelease && !inRelease2 && releaseSlide2 != 0) {
               envSlide = releaseSlide2;
               inRelease2 = true;
+            } else if (!inRelease && autoRelease && releaseSlide != 0) {
+              envSlide = releaseSlide;
+              sustainTargetVol = releaseTargetVol;
+              inRelease = true;
             } else {
               envSlide = 0;
             }
@@ -1832,9 +2091,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   if (numPatterns > 256) numPatterns = 256;
   int songLen = numPatterns;
 
-  printf("XM-Export: %d total rows -> %d patterns (%d rows/pat), %d channels, speed=%d BPM=%d%s\n",
-         totalXmRows, numPatterns, ROWS_PER_PAT, xmChans, xmSpeed, xmBPM,
-         multimode ? " [7V]" : "");
+  /* detail info folded into summary line on stdout */
 
   /* XM header fields (at offset 60, inside the 276-byte header block) */
   writeU16(out, (unsigned short)songLen);  /* song length in patterns */
@@ -1950,14 +2207,23 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
         xmLoopStart = 0;
         xmLoopLen = (unsigned int)smpLen;
       }
-      snprintf(labelBuf, 22, "Instrument %03d", inst + 1);
+      if (inst == 0)
+        snprintf(labelBuf, 22, "domy@noisebay.org");
+      else
+        snprintf(labelBuf, 22, "Instrument %03d", inst + 1);
     }
 
     /* mAddBegin sweep: the Amiga DMA loops the sample while shifting the loop
      * start by sweepAmt bytes every frame.  XM has no such effect, so we bake
-     * the sweep into a longer one-shot sample by concatenating overlapping
-     * loop iterations, each starting from a progressively shifted offset.
-     * Note: baking uses smpLen (sustain only, before attack prepend). */
+     * the sweep into a longer sample by concatenating overlapping loop
+     * iterations, each starting from a progressively shifted offset.
+     *
+     * After the sweep ends (mStop), the Amiga DMA continues looping the
+     * sample at the final offset.  We append one extra copy of the waveform
+     * at the settled offset and set the XM loop to cover only that copy.
+     *
+     * Two-mAddBegin macros (forward then backward sweep) are handled by
+     * switching the sweep direction at sweepReverseFrame. */
     signed char* bakedBuf = NULL;
     int bakedLen = 0;
     if (atkSrcMacro < 0) {
@@ -1966,8 +2232,16 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
         int origLen = smpLen;
         int hp = si2.sweepHalfPeriod;
         bool pingPong = !si2.oneShot && hp > 0;
-        int maxOffset = pingPong ? (hp + 1) * si2.sweepAmt
-                                 : si2.sweepAmt * si2.sweepFrames;
+        bool hasReverse = (si2.sweepAmt2 != 0 && si2.sweepReverseFrame > 0);
+
+        int maxOffset;
+        if (hasReverse)
+          maxOffset = abs((si2.sweepReverseFrame - 1) * si2.sweepAmt);
+        else if (pingPong)
+          maxOffset = (hp + 1) * si2.sweepAmt;
+        else
+          maxOffset = si2.sweepAmt * si2.sweepFrames;
+
         int srcLen = origLen + maxOffset;
         if (smpStart + srcLen > (int)smplLen)
           srcLen = (int)smplLen - smpStart;
@@ -1989,11 +2263,22 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
           nLoops = (nFrames * bytesPerFrame + origLen - 1) / origLen;
           if (nLoops < 2) nLoops = 2;
           if (nLoops > 2048) nLoops = 2048;
-          bakedLen = nLoops * origLen;
-          fprintf(stderr, "  sweep-bake inst=%d: baseNote=%d relNote=%d bpf=%d origLen=%d nFrames=%d nLoops=%d bakedLen=%d %s\n",
-                  inst, baseNote, relNote, bytesPerFrame, origLen, nFrames, nLoops, bakedLen,
-                  pingPong ? "PINGPONG" : "oneway");
-          bakedBuf = (signed char*)malloc((size_t)bakedLen);
+
+          int settledOffset = 0;
+          if (hasReverse) {
+            int peakOff = (si2.sweepReverseFrame - 1) * si2.sweepAmt;
+            settledOffset = peakOff
+                          + (si2.sweepFrames - si2.sweepReverseFrame + 1) * si2.sweepAmt2;
+          } else if (!pingPong) {
+            settledOffset = si2.sweepFrames * si2.sweepAmt;
+          }
+          if (settledOffset < 0) settledOffset = 0;
+          if (settledOffset + origLen > srcLen) settledOffset = srcLen - origLen;
+          if (settledOffset < 0) settledOffset = 0;
+
+          int totalLen = nLoops * origLen + origLen;
+          bakedLen = totalLen;
+          bakedBuf = (signed char*)malloc((size_t)totalLen);
           if (bakedBuf) {
             int writePos = 0;
             for (int lp = 0; lp < nLoops; lp++) {
@@ -2006,9 +2291,13 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                   offset = (phase + 2) * si2.sweepAmt;
                 else
                   offset = (nFrames - phase) * si2.sweepAmt;
+              } else if (hasReverse && frame >= si2.sweepReverseFrame) {
+                int peakOff = (si2.sweepReverseFrame - 1) * si2.sweepAmt;
+                offset = peakOff + (frame - si2.sweepReverseFrame + 1) * si2.sweepAmt2;
               } else {
                 offset = frame * si2.sweepAmt;
               }
+              if (offset < 0) offset = 0;
               for (int b = 0; b < origLen; b++) {
                 int readPos = offset + b;
                 if (readPos >= 0 && readPos < srcLen)
@@ -2017,18 +2306,68 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                   bakedBuf[writePos++] = 0;
               }
             }
-            smpLen = bakedLen;
+            for (int b = 0; b < origLen; b++) {
+              int readPos = settledOffset + b;
+              if (readPos >= 0 && readPos < srcLen)
+                bakedBuf[writePos++] = src[readPos];
+              else
+                bakedBuf[writePos++] = 0;
+            }
+            smpLen = totalLen;
             if (si2.oneShot) {
               loopType = 0;
               xmLoopStart = 0;
               xmLoopLen = 0;
             } else {
               loopType = 1;
-              xmLoopStart = 0;
-              xmLoopLen = (unsigned int)bakedLen;
+              xmLoopStart = (unsigned int)(nLoops * origLen);
+              xmLoopLen = (unsigned int)origLen;
             }
           }
         }
+      }
+    }
+
+    /* 4x upsample very short looping waveforms to approximate the Amiga's
+     * analog reconstruction filter.  Paula's DAC outputs a staircase signal
+     * smoothed by an RC low-pass (~3.3-4.5 kHz).  XM trackers render samples
+     * through software mixing without that filter, so short single-cycle
+     * waves (<=256 bytes) sound harsh at higher pitches — especially noticeable
+     * with complex bass waveforms.  Cubic Hermite 4x interpolation creates a
+     * smoother version; relativeNote is bumped +24 (2 octaves) to keep the
+     * fundamental pitch identical. */
+    if (!bakedBuf && atkSrcMacro < 0 && loopType == 1 &&
+        xmLoopStart == 0 && xmLoopLen == (unsigned int)smpLen &&
+        smpLen >= 4 && smpLen <= 256 &&
+        (int)relNote + 24 <= 127) {
+      const int UPS = 4;
+      int newLen = smpLen * UPS;
+      signed char* upBuf = (signed char*)malloc((size_t)newLen);
+      if (upBuf) {
+        const signed char* src = smpl + smpStart;
+        int n = smpLen;
+        for (int i = 0; i < newLen; i++) {
+          double pos = (double)i / UPS;
+          int idx0 = (int)pos;
+          double frac = pos - idx0;
+          int p0 = src[((idx0 - 1) % n + n) % n];
+          int p1 = src[idx0 % n];
+          int p2 = src[(idx0 + 1) % n];
+          int p3 = src[(idx0 + 2) % n];
+          double a = -0.5*p0 + 1.5*p1 - 1.5*p2 + 0.5*p3;
+          double b = p0 - 2.5*p1 + 2.0*p2 - 0.5*p3;
+          double c = -0.5*p0 + 0.5*p2;
+          double d = p1;
+          double val = a*frac*frac*frac + b*frac*frac + c*frac + d;
+          if (val < -128) val = -128;
+          if (val > 127) val = 127;
+          upBuf[i] = (signed char)(int)round(val);
+        }
+        bakedBuf = upBuf;
+        bakedLen = newLen;
+        smpLen = newLen;
+        xmLoopLen = (unsigned int)newLen;
+        relNote = (signed char)((int)relNote + 24);
       }
     }
 
@@ -2090,6 +2429,6 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   fclose(out);
   free(mdatBuf);
   free(smpl);
-  printf("Wrote %s\n", outPath);
+  printf("Converted: %s  Errors %d\n", outPath, xmErrors);
   return true;
 }

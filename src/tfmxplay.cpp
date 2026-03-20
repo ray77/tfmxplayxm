@@ -26,7 +26,7 @@
 #include "ta-time.h"
 
 #ifndef TFMXPLAY_VERSION
-#define TFMXPLAY_VERSION "0.0.4"
+#define TFMXPLAY_VERSION "0.0.5"
 #endif
 
 #include "blip_buf.h"
@@ -575,6 +575,7 @@ int main(int argc, char** argv) {
   }
 
   if (doConvert2XM) {
+    printVersion();
     string outPath=convert2xmPath;
     if (outPath.empty()) {
       string base=mdat;
