@@ -671,7 +671,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   unsigned char panL, panR;
   switch (pan) {
     case PAN_AMIGA:    panL = 0x00; panR = 0xFF; break;
-    case PAN_HEADPHONE: panL = 0x40; panR = 0xC0; break;
+    case PAN_HEADPHONE: panL = 0x30; panR = 0xD0; break;
     default:           panL = 0x10; panR = 0xF0; break;
   }
   const char* panNames[] = {"Soft","Amiga","Headphone"};

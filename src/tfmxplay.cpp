@@ -492,7 +492,7 @@ void initParams() {
   params.push_back(Param("d","dump",false,parDump,"","dump 16-bit stereo output to tfmx.wav"));
   params.push_back(Param("S","speed",true,parSpeed,"","set speed in clock/2 cycles"));
   params.push_back(Param("c","convert2xm",false,parConvert2XM,"[=file.xm]","convert TFMX to XM file (default: tfmx_<name>.xm)"));
-  params.push_back(Param("p","pan",true,parPan,"(preset)","set XM panning: Amiga (hard L/R), Soft (default, slight bleed), Headphone (centered)"));
+  params.push_back(Param("p","pan",true,parPan,"(preset)","set XM panning (only with -convert2xm): Amiga (hard L/R), Soft (default, near-original), Headphone (reduced stereo)"));
   params.push_back(Param("M","mute",true,parMute,"(channels)","mute channels (e.g. -M 123 mutes ch 1,2,3)"));
 
 #ifdef _SYNC_VBLANK
