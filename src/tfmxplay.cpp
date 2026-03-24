@@ -66,6 +66,8 @@ SDL_AudioSpec ar;
 
 bool quit, ntsc, hle, dumpFile, showVersionOnly, showInfo, doConvert2XM;
 std::string convert2xmPath;
+PanPreset panPreset=PAN_SOFT;
+std::string muteChanStr;
 FILE* dump;
 long dumpDataSize;
 
@@ -463,6 +465,22 @@ bool parConvert2XM(string v) {
   return true;
 }
 
+bool parPan(string v) {
+  if (v=="Amiga" || v=="amiga") panPreset=PAN_AMIGA;
+  else if (v=="Soft" || v=="soft") panPreset=PAN_SOFT;
+  else if (v=="Headphone" || v=="headphone") panPreset=PAN_HEADPHONE;
+  else {
+    printf("unknown pan preset: %s (use Amiga, Soft, or Headphone)\n",v.c_str());
+    return false;
+  }
+  return true;
+}
+
+bool parMute(string v) {
+  muteChanStr=v;
+  return true;
+}
+
 void initParams() {
   params.push_back(Param("h","help",false,parHelp,"","display this help"));
   params.push_back(Param("v","version",false,parVersion,"","show version"));
@@ -474,6 +492,8 @@ void initParams() {
   params.push_back(Param("d","dump",false,parDump,"","dump 16-bit stereo output to tfmx.wav"));
   params.push_back(Param("S","speed",true,parSpeed,"","set speed in clock/2 cycles"));
   params.push_back(Param("c","convert2xm",false,parConvert2XM,"[=file.xm]","convert TFMX to XM file (default: tfmx_<name>.xm)"));
+  params.push_back(Param("p","pan",true,parPan,"(preset)","set XM panning: Amiga (hard L/R), Soft (default, slight bleed), Headphone (centered)"));
+  params.push_back(Param("M","mute",true,parMute,"(channels)","mute channels (e.g. -M 123 mutes ch 1,2,3)"));
 
 #ifdef _SYNC_VBLANK
   params.push_back(Param("V","vblank",false,parVBlank,"","sync to VBlank"));
@@ -587,7 +607,7 @@ int main(int argc, char** argv) {
       if (base.empty()) base="output";
       outPath="tfmx_"+base+".xm";
     }
-    if (!convertToXM(mdat.c_str(),smpl.c_str(),outPath.c_str(),songid)) {
+    if (!convertToXM(mdat.c_str(),smpl.c_str(),outPath.c_str(),songid,panPreset)) {
       return 1;
     }
     return 0;
@@ -596,6 +616,69 @@ int main(int argc, char** argv) {
   if (!p.load(mdat.c_str(),smpl.c_str())) {
     printf("could not open song...\n");
     return 1;
+  }
+
+  for (size_t mi=0; mi<muteChanStr.size(); mi++) {
+    int mc=muteChanStr[mi]-'0';
+    if (mc>=0 && mc<8) { p.mute(mc); printf("muting channel %d\n",mc); }
+  }
+
+  if (dumpFile && !muteChanStr.empty()) {
+    sr=44100;
+    if (ntsc) { targetSR=3579545; speed=59659; }
+    else      { targetSR=3546895; speed=70937; }
+    if (defCIAVal) p.setCIAVal(defCIAVal); else p.setCIAVal(speed);
+
+    bb[0]=blip_new(32768);
+    bb[1]=blip_new(32768);
+    blip_set_rates(bb[0],targetSR,sr);
+    blip_set_rates(bb[1],targetSR,sr);
+    p.hleRate=float((double)targetSR/(double)sr);
+
+    dump=fopen("tfmx.wav","wb");
+    if (!dump) { perror("cannot dump"); return 1; }
+    dumpDataSize=0;
+    wavWriteHeader(dump,sr,2,16);
+
+    p.play(songid);
+    int renderFrames=sr*10;
+    short outBuf[2048];
+    int pos=0;
+    printf("headless render: %d samples...\n",renderFrames);
+    while (pos<renderFrames) {
+      int chunk=1024; if (pos+chunk>renderFrames) chunk=renderFrames-pos;
+      blip_set_rates(bb[0],targetSR,sr);
+      blip_set_rates(bb[1],targetSR,sr);
+      size_t runtotal=blip_clocks_needed(bb[0],chunk);
+      short temp[2];
+      for (size_t i=0; i<runtotal; i++) {
+        p.nextSample(&temp[0],&temp[1]);
+        blip_add_delta(bb[0],i,(temp[0]+(temp[1]>>2)-prevSample[0])<<1);
+        blip_add_delta(bb[1],i,(temp[1]+(temp[0]>>2)-prevSample[1])<<1);
+        prevSample[0]=temp[0]+(temp[1]>>2);
+        prevSample[1]=temp[1]+(temp[0]>>2);
+      }
+      blip_end_frame(bb[0],runtotal);
+      blip_end_frame(bb[1],runtotal);
+      short bbL[1024],bbR[1024];
+      blip_read_samples(bb[0],bbL,chunk,0);
+      blip_read_samples(bb[1],bbR,chunk,0);
+      for (int i=0; i<chunk; i++) { outBuf[i*2]=bbL[i]; outBuf[i*2+1]=bbR[i]; }
+      size_t written=fwrite(outBuf,1,chunk*4,dump);
+      dumpDataSize+=written;
+      pos+=chunk;
+    }
+    wavFinalizeHeader(dump,dumpDataSize);
+    fclose(dump);
+    printf("wrote tfmx.wav (%ld bytes audio data)\n",dumpDataSize);
+    printf("\n--- Per-Channel RMS (raw sample*vol) ---\n");
+    for (int ch=0; ch<4; ch++) {
+      double rms = (p.chanSampleCount > 0) ? sqrt(p.chanSumSq[ch] / p.chanSampleCount) : 0;
+      const char* side = ((ch&1)^((ch&2)>>1)) ? "R" : "L";
+      printf("  Ch %d (%s): RMS = %.1f\n", ch, side, rms);
+    }
+    printf("---\n");
+    return 0;
   }
 
 #ifdef _SYNC_VBLANK

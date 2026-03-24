@@ -1007,27 +1007,28 @@ void TFMXPlayer::nextSample(short* l, short* r) {
         chan[i].seek=chan[i].freq;
         chan[i].apos++;
         if (chan[i].apos>=(chan[i].len*2)) {
-          // interrupt
           handleLoop(i);
           chan[i].apos=0;
         }
       }
     }
+    int chVal = 0;
+    if (chan[i].pos+chan[i].apos>=(int)smplLen) {
+      chVal = smpl[smplLen-1]*chan[i].vol;
+    } else {
+      chVal = smpl[chan[i].pos+chan[i].apos]*chan[i].vol;
+    }
+    if (i < 8) {
+      chanSumSq[i] += (double)chVal * chVal;
+    }
     if (chan[i].muted) continue;
     if ((i&1)^((i&2)>>1)) {
-      if (chan[i].pos+chan[i].apos>=smplLen) {
-        ra+=(smpl[smplLen-1]*chan[i].vol);
-      } else {
-        ra+=(smpl[chan[i].pos+chan[i].apos]*chan[i].vol);
-      }
+      ra += chVal;
     } else {
-      if (chan[i].pos+chan[i].apos>=smplLen) {
-        la+=(smpl[smplLen-1]*chan[i].vol);
-      } else {
-        la+=(smpl[chan[i].pos+chan[i].apos]*chan[i].vol);
-      }
+      la += chVal;
     }
   }
+  chanSampleCount++;
   *l=la;
   *r=ra;
 }

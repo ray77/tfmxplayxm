@@ -218,6 +218,8 @@ class TFMXPlayer {
     bool trace, traceC[8], traceS;
     void nextSample(short* l, short* r);
     void nextSampleHLE(short* l, short* r);
+    double chanSumSq[8];
+    long chanSampleCount;
     void setCIAVal(int val);
     bool mute(int c);
     int play(int song);
@@ -225,7 +227,7 @@ class TFMXPlayer {
     void lock(int chan, int time);
     bool load(const char* mdat, const char* smpl);
     void playMacro(signed char macro, signed char note, signed char vol, unsigned char c, int trans, short detune);
-    TFMXPlayer(): ciaVal(59659), frame(0), loopCount(0), totTracks(0), fractAccum(0), intAccum(0), numChan(0), hleRate(1), trace(false), traceS(false) {
-      for (int i=0; i<8; i++) traceC[i]=false;
+    TFMXPlayer(): ciaVal(59659), frame(0), loopCount(0), totTracks(0), fractAccum(0), intAccum(0), numChan(0), hleRate(1), trace(false), traceS(false), chanSampleCount(0) {
+      for (int i=0; i<8; i++) { traceC[i]=false; chanSumSq[i]=0; }
     }
 };
