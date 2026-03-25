@@ -43,7 +43,7 @@
 #include "convert2xm.h"
 
 #ifndef TFMXPLAY_VERSION
-#define TFMXPLAY_VERSION "0.0.5"
+#define TFMXPLAY_VERSION "0.0.6"
 #endif
 
 /* Win32 lacks arpa/inet.h — provide byte-swap helpers for big-endian TFMX data */
@@ -89,6 +89,119 @@ static void writeU32(FILE* f, unsigned int v) {
     (unsigned char)(v >> 24)
   };
   fwrite(b, 1, 4, f);
+}
+
+/*
+ * Song-specific patches.  Some TFMX songs produce conversion artifacts
+ * (hanging notes, volume escalation) that can't be fixed generically
+ * without breaking other songs.  Patches are matched by the mdat
+ * filename's basename (e.g. "mdat.T2_Title") and subsong number.
+ */
+struct XMCell { unsigned char note, inst, vol, fx, param; };
+
+struct SongFixEntry {
+  int channel;     /* XM channel, 0-based (-1 = any) */
+  int instrument;  /* XM instrument, 1-based (-1 = any) */
+  int fromRow;     /* first row to apply fix (-1 = start of song) */
+  int toRow;       /* last row (exclusive) to apply fix (-1 = end of song) */
+  int orphanGap;   /* override orphan gap in rows (-1 = default) */
+  int maxVolume;   /* cap XM volume column to this value (-1 = no cap) */
+  int minNoteGap;  /* min rows between note-ons; faster retriggers blanked (-1 = off) */
+  int volSlideDown; /* XM vol-slide-down per tick on empty rows in range (1-15, -1 = off) */
+  bool suppress;   /* true = note-off + blank all note-ons in range */
+};
+
+struct SongPatch {
+  const char* mdatName;        /* basename to match (e.g. "mdat.T2_Title"), primary key */
+  unsigned int mdatHash;       /* fallback: hash of mdat content */
+  unsigned int noteFingerprint; /* last resort: hash of first N note events */
+  int subsong;                 /* -1 = all subsongs */
+  const char* label;           /* human-readable name for diagnostics */
+  SongFixEntry fixes[8];
+};
+
+static unsigned int hashMdat(const unsigned char* buf, size_t len) {
+  unsigned int h = 5381;
+  for (size_t i = 0; i < len; i++)
+    h = ((h << 5) + h) ^ buf[i];
+  return h;
+}
+
+#define NOTE_FP_EVENTS 200
+static unsigned int computeNoteFingerprint(const XMCell* grid, int totalRows, int numChans) {
+  unsigned int h = 5381;
+  int count = 0;
+  for (int row = 0; row < totalRows && count < NOTE_FP_EVENTS; row++) {
+    for (int c = 0; c < numChans && count < NOTE_FP_EVENTS; c++) {
+      const XMCell* cell = &grid[row * numChans + c];
+      if (cell->note > 0 && cell->note < 97 && cell->inst > 0) {
+        h = ((h << 5) + h) ^ (unsigned int)c;
+        h = ((h << 5) + h) ^ (unsigned int)cell->note;
+        h = ((h << 5) + h) ^ (unsigned int)cell->inst;
+        count++;
+      }
+    }
+  }
+  return h;
+}
+
+/*                                                                                ch  inst  from   to   oGap  maxV  mnGap vSlD  suppr */
+static const SongPatch songPatches[] = {
+  { "mdat.T2_Title",  0x5adadcd4u, 0xd9df46bbu, 0, "T2_Title", {
+    {  1,  14,  384,  -1,   -1,   -1,   -1,  -1, true  }, /* Ch01 Inst14: suppress from row 384 */
+    {  0,   5,   -1,  -1,   -1,   42,   -1,  -1, false }, /* Ch00 Inst05: volume cap 42 */
+    { -1,  -1,   -1,  -1,   -1,   -1,   -1,  -1, false }, /* sentinel */
+  }},
+  { "mdat.T2_World1", 0x87b88ce6u, 0x5493b2deu, 3, "T2_World1 Sub03", {
+    {  2,  64,   -1,  -1,   48,   -1,   -1,  -1, false }, /* Ch02 Inst64: orphan gap 48 only */
+    { -1,  -1,   -1,  -1,   -1,   -1,   -1,  -1, false },
+  }},
+  { "mdat.T2_World1", 0x87b88ce6u, 0xbe3a7040u, 4, "T2_World1 Sub04", {
+    {  1,  54,   -1,  -1,   12,   -1,   -1,  -1, false }, /* Ch01 Inst54 bass: note-off after 12 rows silence */
+    { -1,  -1,   -1,  -1,   -1,   -1,   -1,  -1, false },
+  }},
+  { NULL, 0, 0, -1, NULL, {{ -1, -1, -1, -1, -1, -1, -1, -1, false }} },
+};
+
+static const char* basenameOf(const char* path) {
+  const char* s = strrchr(path, '/');
+  if (!s) s = strrchr(path, '\\');
+  return s ? s + 1 : path;
+}
+
+static const SongPatch* findSongPatch(const char* mdatPath,
+                                       unsigned int hash,
+                                       unsigned int noteFP,
+                                       int subsong,
+                                       const char** matchMethod) {
+  const char* base = basenameOf(mdatPath);
+
+  /* Pass 1: match by filename */
+  for (int i = 0; songPatches[i].label; i++) {
+    if (songPatches[i].subsong != -1 && songPatches[i].subsong != subsong) continue;
+    if (songPatches[i].mdatName && strcmp(base, songPatches[i].mdatName) == 0) {
+      *matchMethod = "name";
+      return &songPatches[i];
+    }
+  }
+  /* Pass 2: match by mdat content hash */
+  for (int i = 0; songPatches[i].label; i++) {
+    if (songPatches[i].subsong != -1 && songPatches[i].subsong != subsong) continue;
+    if (songPatches[i].mdatHash != 0 && songPatches[i].mdatHash == hash) {
+      *matchMethod = "hash";
+      return &songPatches[i];
+    }
+  }
+  /* Pass 3: match by note fingerprint */
+  for (int i = 0; songPatches[i].label; i++) {
+    if (songPatches[i].subsong != -1 && songPatches[i].subsong != subsong) continue;
+    if (songPatches[i].noteFingerprint != 0 && songPatches[i].noteFingerprint == noteFP) {
+      *matchMethod = "notes";
+      return &songPatches[i];
+    }
+  }
+  *matchMethod = NULL;
+  return NULL;
 }
 
 /*
@@ -811,7 +924,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
 
   auto volMap = [&](int v) -> int {
     (void)multimode;
-    return v;
+    return scaleVol(v);
   };
 
   /* Open output XM */
@@ -855,8 +968,6 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   const int STUTTER_CHANS = 4; /* pulsing pads: Amiga ch 0–3 → XM ch 13–16 */
   int numChans = BASE_CHANS + OVERFLOW_CHANS + STUTTER_CHANS;
 
-  /* One cell per channel per row — matches XM's packed pattern cell format */
-  struct XMCell { unsigned char note, inst, vol, fx, param; };
   XMCell* bigGrid = (XMCell*)calloc((size_t)MAX_TOTAL_ROWS * numChans, sizeof(XMCell));
   if (!bigGrid) { fclose(out); free(mdatBuf); free(smpl); return false; }
 
@@ -1059,8 +1170,10 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
    * stored in the upper instrument slots (macro + 65).
    * For mCont macros, use the resolved target's sample info. */
   MacroSampleInfo macroSI[128];
+  MacroSampleInfo macroSrcSI[128]; /* source macro's sample info (before mCont resolve) */
   int atkInstMap[128];  /* atkInstMap[m] = XM instrument number (1-based) for attack; 0 = none */
   for (int i = 0; i < 128; i++) {
+    macroSrcSI[i] = getMacroSample(macro[i]);
     int resolved = (macroContTarget[i] >= 0) ? macroContTarget[i] : i;
     macroSI[i] = getMacroSample(macro[resolved]);
     /* mOneShot in source macro overrides oneShot flag */
@@ -1743,44 +1856,169 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     }
   }
 
-  /* 7V orphan-note cleanup: in multimode, notes that receive no events
-   * for a very long span are likely orphaned (the owning track moved on).
-   * Insert a key-up so Phase 2 can apply a natural release fade.
-   * Before inserting key-off, look ahead to see if the channel has a
-   * future note-on — if so, the note is intentionally sustained. */
-  if (multimode) {
-    const int ORPHAN_GAP = 96; /* ~1.5 XM patterns of total silence */
+
+  /* Look up song-specific patches: name → hash → note fingerprint */
+  unsigned int mHash = hashMdat(mdatBuf, mdatSize);
+  unsigned int noteFP = computeNoteFingerprint(bigGrid, totalXmRows, numChans);
+  const char* matchMethod = NULL;
+  const SongPatch* patch = findSongPatch(mdatPath, mHash, noteFP, subsong, &matchMethod);
+  printf("mdat: %s  hash: 0x%08x  noteFP: 0x%08x\n", basenameOf(mdatPath), mHash, noteFP);
+  if (patch)
+    printf("Song patch active: %s (matched by %s)\n", patch->label, matchMethod);
+
+  /* Orphan-note cleanup.  In multimode, notes that receive no events for
+   * a long span are likely orphaned.  Insert a key-off so Phase 2 can
+   * apply a natural release fade.  Song patches can override the gap. */
+  {
+    const int DEFAULT_GAP = multimode ? 96 : -1; /* -1 = disabled */
     for (int c = 0; c < BASE_CHANS; c++) {
+      int gap = DEFAULT_GAP;
+      /* Check for per-channel/instrument patch overrides */
+      if (patch) {
+        for (int fi = 0; patch->fixes[fi].channel != -1 || patch->fixes[fi].instrument != -1; fi++) {
+          const SongFixEntry& fix = patch->fixes[fi];
+          if (fix.orphanGap > 0 && (fix.channel == -1 || fix.channel == c))
+            if (gap < 0 || fix.orphanGap < gap)
+              gap = fix.orphanGap;
+        }
+      }
+      if (gap < 0) continue;
+
       int lastEventRow = -1;
       bool noteActive = false;
+      int activeInst = 0;
       for (int row = 0; row < totalXmRows; row++) {
         XMCell* cell = &bigGrid[row * numChans + c];
         bool hasEvent = (cell->note > 0 || cell->inst > 0 ||
                          cell->vol > 0  || cell->fx > 0 || cell->param > 0);
         if (cell->note > 0 && cell->note < 97 && cell->inst > 0) {
           noteActive = true;
+          activeInst = cell->inst;
           lastEventRow = row;
         } else if (cell->note == 97) {
           noteActive = false;
+          activeInst = 0;
           lastEventRow = row;
         } else if (hasEvent) {
           lastEventRow = row;
-        } else if (noteActive && lastEventRow >= 0 &&
-                   (row - lastEventRow) == ORPHAN_GAP) {
-          bool hasFutureNote = false;
-          for (int frow = row + 1; frow < totalXmRows; frow++) {
-            XMCell* fc = &bigGrid[frow * numChans + c];
-            if (fc->note > 0 && fc->note < 97 && fc->inst > 0) {
-              hasFutureNote = true;
-              break;
+        } else if (noteActive && lastEventRow >= 0) {
+          /* Determine effective gap for this instrument */
+          int effGap = gap;
+          if (patch) {
+            for (int fi = 0; patch->fixes[fi].channel != -1 || patch->fixes[fi].instrument != -1; fi++) {
+              const SongFixEntry& fix = patch->fixes[fi];
+              if (fix.orphanGap > 0 &&
+                  (fix.channel == -1 || fix.channel == c) &&
+                  (fix.instrument == -1 || fix.instrument == activeInst))
+                effGap = fix.orphanGap;
             }
           }
-          if (hasFutureNote) {
-            lastEventRow = row;
-            continue;
+          if ((row - lastEventRow) == effGap) {
+            /* Patch-specified gaps always trigger (the patch knows this
+             * instrument has legitimate silences that need cutting).
+             * Default gaps only trigger when no future note exists. */
+            bool patchOverride = (effGap != gap);
+            if (!patchOverride) {
+              bool hasFutureNote = false;
+              for (int frow = row + 1; frow < totalXmRows; frow++) {
+                XMCell* fc = &bigGrid[frow * numChans + c];
+                if (fc->note > 0 && fc->note < 97 && fc->inst > 0) {
+                  hasFutureNote = true;
+                  break;
+                }
+              }
+              if (hasFutureNote) {
+                lastEventRow = row;
+                continue;
+              }
+            }
+            cell->note = 97;
+            noteActive = false;
+            activeInst = 0;
           }
+        }
+      }
+      /* End-of-song: if a note is still active, insert note-off on the
+       * last row so it doesn't bleed across the XM loop boundary. */
+      if (noteActive && totalXmRows > 1) {
+        int r = totalXmRows - 1;
+        XMCell* cell = &bigGrid[r * numChans + c];
+        if (cell->note == 0 || cell->note == 97) {
           cell->note = 97;
-          noteActive = false;
+          cell->vol  = 0;
+        }
+      }
+    }
+  }
+
+  /* Song-patch: insert note-offs for instruments with patch-specified orphan gaps.
+   * Unlike the generic orphan cleanup above (which is blocked by volume events),
+   * this only counts note-on events for the target instrument. */
+  if (patch) {
+    for (int c = 0; c < numChans; c++) {
+      for (int fi = 0; patch->fixes[fi].channel != -1 || patch->fixes[fi].instrument != -1; fi++) {
+        const SongFixEntry& fix = patch->fixes[fi];
+        if (fix.orphanGap <= 0) continue;
+        if (fix.channel != -1 && fix.channel != c) continue;
+        int tgtInst = fix.instrument;
+        int lastNoteRow = -1;
+        bool instActive = false;
+        for (int row = 0; row < totalXmRows; row++) {
+          XMCell* cell = &bigGrid[row * numChans + c];
+          if (cell->note > 0 && cell->note < 97 && cell->inst > 0) {
+            if (tgtInst == -1 || cell->inst == tgtInst) {
+              lastNoteRow = row;
+              instActive = true;
+            } else {
+              instActive = false;
+            }
+          } else if (cell->note == 97) {
+            instActive = false;
+          } else if (instActive && lastNoteRow >= 0 &&
+                     (row - lastNoteRow) == fix.orphanGap) {
+            cell->note = 97;
+            cell->vol  = 0;
+            instActive = false;
+          }
+        }
+      }
+    }
+  }
+
+  /* Song-patch: suppress or thin-out notes in specific row ranges. */
+  if (patch) {
+    for (int c = 0; c < numChans; c++) {
+      for (int fi = 0; patch->fixes[fi].channel != -1 || patch->fixes[fi].instrument != -1; fi++) {
+        const SongFixEntry& fix = patch->fixes[fi];
+        if (!fix.suppress && fix.minNoteGap <= 0) continue;
+        if (fix.channel != -1 && fix.channel != c) continue;
+        int rStart = (fix.fromRow >= 0) ? fix.fromRow : 0;
+        int rEnd   = (fix.toRow >= 0) ? fix.toRow : totalXmRows;
+        int lastKeptRow = -9999;
+        bool inserted_off = false;
+        for (int row = rStart; row < rEnd && row < totalXmRows; row++) {
+          XMCell* cell = &bigGrid[row * numChans + c];
+          if (cell->note > 0 && cell->note < 97 && cell->inst > 0) {
+            if (fix.instrument != -1 && cell->inst != fix.instrument) continue;
+            if (fix.suppress) {
+              if (!inserted_off) {
+                cell->note = 97;
+                cell->inst = 0; cell->vol = 0;
+                if (cell->fx == 8) { cell->fx = 0; cell->param = 0; }
+                inserted_off = true;
+              } else {
+                cell->note = 0; cell->inst = 0; cell->vol = 0;
+                if (cell->fx == 8) { cell->fx = 0; cell->param = 0; }
+              }
+            } else if (fix.minNoteGap > 0) {
+              if ((row - lastKeptRow) < fix.minNoteGap) {
+                cell->note = 0; cell->inst = 0; cell->vol = 0;
+                if (cell->fx == 8) { cell->fx = 0; cell->param = 0; }
+              } else {
+                lastKeptRow = row;
+              }
+            }
+          }
         }
       }
     }
@@ -1854,6 +2092,19 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
           if (effVol > 64) effVol = 64;
           if (effVol < 0) effVol = 0;
           int scaledEV = volMap(effVol);
+          /* Apply song-patch volume cap / fade if applicable */
+          if (patch) {
+            for (int fi = 0; patch->fixes[fi].channel != -1 || patch->fixes[fi].instrument != -1; fi++) {
+              const SongFixEntry& fix = patch->fixes[fi];
+              if ((fix.channel != -1 && fix.channel != ch) ||
+                  (fix.instrument != -1 && fix.instrument != (idx+1)))
+                continue;
+              if (fix.fromRow >= 0 && row < fix.fromRow) continue;
+              if (fix.toRow >= 0 && row >= fix.toRow) continue;
+              if (fix.maxVolume >= 0 && scaledEV > fix.maxVolume)
+                scaledEV = fix.maxVolume;
+            }
+          }
           cell->vol = (unsigned char)(0x10 + scaledEV);
           /* Diagnostic: note-on volume trace */
           printf("  NOTE ch=%d row=%d inst=%d vel=%d effVol=%d scaled=%d\n",
@@ -2471,6 +2722,94 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
             } else {
               printf(" -> SKIP (no norm needed)\n");
             }
+          }
+        }
+      }
+    }
+
+    /* Negative mAddBegin sweep: not expressible in XM format.
+     * On the Amiga, mAddBegin with negative amount shifts the DMA read
+     * pointer backward through the SMPL bank each frame, reading bytes
+     * from neighbouring instruments.  This creates the bass "wobble."
+     * Baking this into the XM sample fails because the foreign sample
+     * data (e.g. SFX) becomes audible as artifacts.  XM has no mechanism
+     * for real-time sample-start modulation, so this effect is skipped. */
+
+    /* mCont sweep attack prefix: when the source macro uses a tiny wavetable
+     * with a positive sweep as its attack, and mCont redirects to a different
+     * sustained sample, bake the sweep attack and prepend it to the sustained
+     * sample.  The loop then covers only the sustained portion. */
+    if (atkSrcMacro < 0 && !bakedBuf && macroContTarget[inst] >= 0) {
+      MacroSampleInfo& srcSI = macroSrcSI[inst];
+      if (srcSI.sweepAmt > 0 && srcSI.len > 0 && srcSI.len <= 128 && smpLen >= 4) {
+        int atkOrigLen = srcSI.len;
+        int atkStart = srcSI.start;
+        int hp = srcSI.sweepHalfPeriod;
+        int nFrames = (hp > 0) ? 2 * hp : srcSI.sweepFrames;
+        if (nFrames < 1) nFrames = srcSI.sweepFrames;
+        if (nFrames < 1) nFrames = 8;
+
+        int maxOffset = (hp > 0) ? (hp + 1) * srcSI.sweepAmt : srcSI.sweepAmt * nFrames;
+        int atkSrcLen = atkOrigLen + maxOffset;
+        if (atkStart + atkSrcLen > (int)smplLen)
+          atkSrcLen = (int)smplLen - atkStart;
+
+        if (atkSrcLen > atkOrigLen) {
+          int baseNote = 49;
+          if (instFirstXmNote[inst] > 0) baseNote = instFirstXmNote[inst];
+          int bytesPerFrame = (int)(256.0 * pow(2.0, (baseNote - 49 + relNote) / 12.0) + 0.5);
+          if (bytesPerFrame < 32) bytesPerFrame = 32;
+
+          int nLoops = (nFrames * bytesPerFrame + atkOrigLen - 1) / atkOrigLen;
+          if (nLoops < 2) nLoops = 2;
+          if (nLoops > 512) nLoops = 512;
+
+          int atkBakedLen = nLoops * atkOrigLen;
+          int totalLen = atkBakedLen + smpLen;
+          bakedBuf = (signed char*)malloc((size_t)totalLen);
+          if (bakedBuf) {
+            const signed char* atkSrc = smpl + atkStart;
+            int writePos = 0;
+            for (int lp = 0; lp < nLoops; lp++) {
+              int frame = (int)((double)lp * atkOrigLen / bytesPerFrame);
+              if (frame >= nFrames) frame = nFrames - 1;
+              int offset;
+              if (hp > 0) {
+                int phase = frame % (2 * hp);
+                if (phase < hp)
+                  offset = (phase + 2) * srcSI.sweepAmt;
+                else
+                  offset = (2 * hp - phase) * srcSI.sweepAmt;
+              } else {
+                offset = frame * srcSI.sweepAmt;
+              }
+              if (offset < 0) offset = 0;
+              for (int b = 0; b < atkOrigLen; b++) {
+                int readPos = offset + b;
+                if (readPos >= 0 && readPos < atkSrcLen)
+                  bakedBuf[writePos++] = atkSrc[readPos];
+                else
+                  bakedBuf[writePos++] = 0;
+              }
+            }
+            /* Append the sustained sample */
+            const signed char* susSrc = smpl + smpStart;
+            for (int b = 0; b < smpLen; b++) {
+              if (smpStart + b < (int)smplLen)
+                bakedBuf[writePos++] = susSrc[b];
+              else
+                bakedBuf[writePos++] = 0;
+            }
+            bakedLen = totalLen;
+            loopType = 1;
+            xmLoopStart = (unsigned int)atkBakedLen + xmLoopStart;
+            xmLoopLen = (xmLoopLen > 0) ? xmLoopLen : (unsigned int)smpLen;
+            if (xmLoopStart + xmLoopLen > (unsigned int)totalLen)
+              xmLoopLen = (unsigned int)totalLen - xmLoopStart;
+            smpLen = totalLen;
+
+            printf("  SWEEP ATK PREFIX Inst %d: atkLen=%d sweepFrames=%d atkBaked=%d sustainLen=%d total=%d\n",
+                   inst+1, atkOrigLen, nFrames, atkBakedLen, smpLen - atkBakedLen, totalLen);
           }
         }
       }
