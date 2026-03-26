@@ -97,29 +97,37 @@ static void writeU32(FILE* f, unsigned int v) {
  * without breaking other songs.  Patches are matched by the mdat
  * filename's basename (e.g. "mdat.T2_Title") and subsong number.
  */
+/* XM pattern cell — matches the five fields of an XM packed note event. */
 struct XMCell { unsigned char note, inst, vol, fx, param; };
 
+/* One targeted fix within a song patch.  Each fix addresses a specific
+ * conversion artefact on one channel/instrument in a given row range.
+ * Fields set to -1 (or false) are inactive / wildcards. */
 struct SongFixEntry {
-  int channel;     /* XM channel, 0-based (-1 = any) */
-  int instrument;  /* XM instrument, 1-based (-1 = any) */
-  int fromRow;     /* first row to apply fix (-1 = start of song) */
-  int toRow;       /* last row (exclusive) to apply fix (-1 = end of song) */
-  int orphanGap;   /* override orphan gap in rows (-1 = default) */
-  int maxVolume;   /* cap XM volume column to this value (-1 = no cap) */
-  int minNoteGap;  /* min rows between note-ons; faster retriggers blanked (-1 = off) */
-  int volSlideDown; /* XM vol-slide-down per tick on empty rows in range (1-15, -1 = off) */
-  bool suppress;   /* true = note-off + blank all note-ons in range */
+  int channel;      /* XM channel, 0-based (-1 = any) */
+  int instrument;   /* XM instrument, 1-based (-1 = any) */
+  int fromRow;      /* first row to apply fix (-1 = start of song) */
+  int toRow;        /* last row (exclusive) to apply fix (-1 = end of song) */
+  int orphanGap;    /* insert note-off after this many silent rows (-1 = default) */
+  int maxVolume;    /* cap volume to this value; 0 + fromRow/toRow = mute range (-1 = off) */
+  int minNoteGap;   /* min rows between note-ons; faster retriggers blanked (-1 = off) */
+  int volSlideDown;  /* XM vol-slide-down per tick on empty rows (1-15, -1 = off) */
+  bool suppress;    /* blank all matching note-ons in range */
 };
 
+/* Song-specific patch, identified by up to three methods (tried in order):
+ * 1. mdat filename basename  2. mdat content hash  3. note fingerprint.
+ * Contains up to 8 fix entries (terminated by a sentinel with ch=-1, inst=-1). */
 struct SongPatch {
-  const char* mdatName;        /* basename to match (e.g. "mdat.T2_Title"), primary key */
-  unsigned int mdatHash;       /* fallback: hash of mdat content */
-  unsigned int noteFingerprint; /* last resort: hash of first N note events */
-  int subsong;                 /* -1 = all subsongs */
-  const char* label;           /* human-readable name for diagnostics */
+  const char* mdatName;         /* e.g. "mdat.T2_Title" — primary match key */
+  unsigned int mdatHash;        /* djb2 hash of mdat file content */
+  unsigned int noteFingerprint; /* djb2 hash of first 200 note events in bigGrid */
+  int subsong;                  /* -1 = all subsongs */
+  const char* label;            /* human-readable name for log output */
   SongFixEntry fixes[8];
 };
 
+/* djb2 hash of raw mdat file bytes — used as fallback song identifier. */
 static unsigned int hashMdat(const unsigned char* buf, size_t len) {
   unsigned int h = 5381;
   for (size_t i = 0; i < len; i++)
@@ -127,6 +135,9 @@ static unsigned int hashMdat(const unsigned char* buf, size_t len) {
   return h;
 }
 
+/* Build a fingerprint from the first N note-on events in the converted
+ * bigGrid.  Hashes (channel, note, instrument) triples so the same musical
+ * content produces the same fingerprint even if the file was re-dumped. */
 #define NOTE_FP_EVENTS 200
 static unsigned int computeNoteFingerprint(const XMCell* grid, int totalRows, int numChans) {
   unsigned int h = 5381;
@@ -145,7 +156,10 @@ static unsigned int computeNoteFingerprint(const XMCell* grid, int totalRows, in
   return h;
 }
 
-/*                                                                                ch  inst  from   to   oGap  maxV  mnGap vSlD  suppr */
+/* ---- Song patch table ----
+ * Each entry targets a specific mdat + subsong and lists up to 8 fixes.
+ * Fix rows terminated by sentinel {-1,-1,...}.
+ *                                                                                ch  inst  from   to   oGap  maxV  mnGap vSlD  suppr */
 static const SongPatch songPatches[] = {
   { "mdat.T2_Title",  0x5adadcd4u, 0xd9df46bbu, 0, "T2_Title", {
     {  1,  14,  384,  -1,   -1,   -1,   -1,  -1, true  }, /* Ch01 Inst14: suppress monotone loop from row 384 */
@@ -173,6 +187,9 @@ static const char* basenameOf(const char* path) {
   return s ? s + 1 : path;
 }
 
+/* Three-tier song identification: try name first (fast, human-readable),
+ * then content hash (works for renamed files), then note fingerprint
+ * (works even if the binary was patched but the music is the same). */
 static const SongPatch* findSongPatch(const char* mdatPath,
                                        unsigned int hash,
                                        unsigned int noteFP,
@@ -180,28 +197,21 @@ static const SongPatch* findSongPatch(const char* mdatPath,
                                        const char** matchMethod) {
   const char* base = basenameOf(mdatPath);
 
-  /* Pass 1: match by filename */
-  for (int i = 0; songPatches[i].label; i++) {
-    if (songPatches[i].subsong != -1 && songPatches[i].subsong != subsong) continue;
-    if (songPatches[i].mdatName && strcmp(base, songPatches[i].mdatName) == 0) {
-      *matchMethod = "name";
-      return &songPatches[i];
-    }
-  }
-  /* Pass 2: match by mdat content hash */
-  for (int i = 0; songPatches[i].label; i++) {
-    if (songPatches[i].subsong != -1 && songPatches[i].subsong != subsong) continue;
-    if (songPatches[i].mdatHash != 0 && songPatches[i].mdatHash == hash) {
-      *matchMethod = "hash";
-      return &songPatches[i];
-    }
-  }
-  /* Pass 3: match by note fingerprint */
-  for (int i = 0; songPatches[i].label; i++) {
-    if (songPatches[i].subsong != -1 && songPatches[i].subsong != subsong) continue;
-    if (songPatches[i].noteFingerprint != 0 && songPatches[i].noteFingerprint == noteFP) {
-      *matchMethod = "notes";
-      return &songPatches[i];
+  for (int pass = 0; pass < 3; pass++) {
+    for (int i = 0; songPatches[i].label; i++) {
+      if (songPatches[i].subsong != -1 && songPatches[i].subsong != subsong) continue;
+      bool match = false;
+      if (pass == 0 && songPatches[i].mdatName)
+        match = (strcmp(base, songPatches[i].mdatName) == 0);
+      else if (pass == 1 && songPatches[i].mdatHash)
+        match = (songPatches[i].mdatHash == hash);
+      else if (pass == 2 && songPatches[i].noteFingerprint)
+        match = (songPatches[i].noteFingerprint == noteFP);
+      if (match) {
+        static const char* methods[] = { "name", "hash", "notes" };
+        *matchMethod = methods[pass];
+        return &songPatches[i];
+      }
     }
   }
   *matchMethod = NULL;
