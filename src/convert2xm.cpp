@@ -43,7 +43,7 @@
 #include "convert2xm.h"
 
 #ifndef TFMXPLAY_VERSION
-#define TFMXPLAY_VERSION "0.0.6"
+#define TFMXPLAY_VERSION "0.0.7"
 #endif
 
 /* Win32 lacks arpa/inet.h — provide byte-swap helpers for big-endian TFMX data */
@@ -148,7 +148,7 @@ static unsigned int computeNoteFingerprint(const XMCell* grid, int totalRows, in
 /*                                                                                ch  inst  from   to   oGap  maxV  mnGap vSlD  suppr */
 static const SongPatch songPatches[] = {
   { "mdat.T2_Title",  0x5adadcd4u, 0xd9df46bbu, 0, "T2_Title", {
-    {  1,  14,  384,  -1,   -1,   -1,   -1,  -1, true  }, /* Ch01 Inst14: suppress from row 384 */
+    {  1,  14,  384,  -1,   -1,   -1,   -1,  -1, true  }, /* Ch01 Inst14: suppress monotone loop from row 384 */
     {  0,   5,   -1,  -1,   -1,   42,   -1,  -1, false }, /* Ch00 Inst05: volume cap 42 */
     { -1,  -1,   -1,  -1,   -1,   -1,   -1,  -1, false }, /* sentinel */
   }},
@@ -158,6 +158,10 @@ static const SongPatch songPatches[] = {
   }},
   { "mdat.T2_World1", 0x87b88ce6u, 0xbe3a7040u, 4, "T2_World1 Sub04", {
     {  1,  54,   -1,  -1,   12,   -1,   -1,  -1, false }, /* Ch01 Inst54 bass: note-off after 12 rows silence */
+    { -1,  -1,   -1,  -1,   -1,   -1,   -1,  -1, false },
+  }},
+  { "mdat.T2_World2", 0x12a3f169u, 0xdaf49cf2u, 0, "T2_World2 Sub00", {
+    {  0,  -1,    0,   1,   -1,    0,   -1,  -1, false }, /* Ch00 row0: vol=0 to kill loop bleed */
     { -1,  -1,   -1,  -1,   -1,   -1,   -1,  -1, false },
   }},
   { NULL, 0, 0, -1, NULL, {{ -1, -1, -1, -1, -1, -1, -1, -1, false }} },
@@ -1946,6 +1950,23 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
         if (cell->note == 0 || cell->note == 97) {
           cell->note = 97;
           cell->vol  = 0;
+        }
+      }
+    }
+  }
+
+  /* Song-patch: force mute on specific rows (maxVolume=0 with fromRow/toRow).
+   * Writes vol=0x10 (XM "set volume 0") to kill bleeding notes at loop points. */
+  if (patch) {
+    for (int c = 0; c < numChans; c++) {
+      for (int fi = 0; patch->fixes[fi].channel != -1 || patch->fixes[fi].instrument != -1; fi++) {
+        const SongFixEntry& fix = patch->fixes[fi];
+        if (fix.maxVolume != 0 || fix.fromRow < 0 || fix.toRow < 0) continue;
+        if (fix.channel != -1 && fix.channel != c) continue;
+        for (int row = fix.fromRow; row < fix.toRow && row < totalXmRows; row++) {
+          XMCell* cell = &bigGrid[row * numChans + c];
+          if (cell->note == 0 && cell->vol == 0)
+            cell->vol = 0x10;
         }
       }
     }

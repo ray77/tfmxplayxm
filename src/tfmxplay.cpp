@@ -26,7 +26,7 @@
 #include "ta-time.h"
 
 #ifndef TFMXPLAY_VERSION
-#define TFMXPLAY_VERSION "0.0.6"
+#define TFMXPLAY_VERSION "0.0.7"
 #endif
 
 #include "blip_buf.h"
