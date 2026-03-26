@@ -162,7 +162,7 @@ static unsigned int computeNoteFingerprint(const XMCell* grid, int totalRows, in
  *                                                                                ch  inst  from   to   oGap  maxV  mnGap vSlD  suppr */
 static const SongPatch songPatches[] = {
   { "mdat.T2_Title",  0x5adadcd4u, 0xd9df46bbu, 0, "T2_Title", {
-    {  1,  14,  384,  -1,   -1,   -1,   -1,  -1, true  }, /* Ch01 Inst14: suppress monotone loop from row 384 */
+    {  1,  -1, 1665, 1666,   -1,    0,   -1,  -1, false }, /* Pattern-Fix: kill Inst14 ring at pat26 row1 */
     {  0,   5,   -1,  -1,   -1,   42,   -1,  -1, false }, /* Ch00 Inst05: volume cap 42 */
     { -1,  -1,   -1,  -1,   -1,   -1,   -1,  -1, false }, /* sentinel */
   }},
@@ -181,6 +181,7 @@ static const SongPatch songPatches[] = {
   { NULL, 0, 0, -1, NULL, {{ -1, -1, -1, -1, -1, -1, -1, -1, false }} },
 };
 
+/* Extract the filename portion from a full path (after last / or \). */
 static const char* basenameOf(const char* path) {
   const char* s = strrchr(path, '/');
   if (!s) s = strrchr(path, '\\');
@@ -620,6 +621,10 @@ static MacroEffectInfo getMacroEffects(const TFMXMacroData allMacros[128][256],
         break;
       }
       case mCont:
+        /* mCont after mOn: continue execution in a different macro at a
+         * given step.  Used for wavetable-attack → sustain transitions.
+         * We follow the redirect so that envelope/volume extraction
+         * picks up the sustain macro's parameters. */
         if (afterOn) {
           int target = macro[i].data[0];
           int step   = (macro[i].data[1] << 8) | macro[i].data[2];
@@ -795,6 +800,9 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   signed char* smpl = NULL;
   size_t smplLen = 0;
 
+  /* Stereo panning values for XM effect 8xx (0x00=full left, 0x80=center, 0xFF=full right).
+   * Amiga mode reproduces the original hard-panned Amiga sound.
+   * Soft narrows the image slightly for speakers; Headphone narrows further. */
   unsigned char panL, panR;
   switch (pan) {
     case PAN_AMIGA:    panL = 0x00; panR = 0xFF; break;
@@ -936,6 +944,8 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   }
   (void)multimode; /* detection logged in summary line */
 
+  /* Volume mapping: wraps scaleVol() so all volume conversions in this
+   * function go through a single point (easy to swap for per-mode curves). */
   auto volMap = [&](int v) -> int {
     (void)multimode;
     return scaleVol(v);
@@ -1022,12 +1032,12 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     int vol;       /* current volume (0-64), initialized from effective note volume */
   };
   ChanEnv chanEnv[8];
-  bool chanAlive[8];
-  bool stutterUsed[4] = {false, false, false, false};
-  int lastEnveVol[8]; /* last scaled volume written by pEnve, for computing slides */
-  bool chanPortaActive[8];
-  int  chanPortaParam[8];
-  int  chanLastMacro[8];
+  bool chanAlive[8];             /* true while a channel has an audible note playing */
+  bool stutterUsed[4] = {false, false, false, false}; /* tracks which Amiga ch use stutter overflow */
+  int lastEnveVol[8];            /* last scaled volume written by pEnve, for computing slides */
+  bool chanPortaActive[8];       /* true while tone portamento (3xx) is active on a channel */
+  int  chanPortaParam[8];        /* current portamento speed for 3xx continuation rows */
+  int  chanLastMacro[8];         /* last instrument (macro index) triggered on each channel */
   for (int c = 0; c < 8; c++) {
     chanEnv[c].active = false;
     chanAlive[c] = false;
@@ -1037,11 +1047,11 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     chanLastMacro[c] = -1;
   }
 
-  int totalXmRows = 0;
-  int ordRowToXmRow[128];
+  int totalXmRows = 0;          /* running count of XM rows written so far */
+  int ordRowToXmRow[128];       /* maps TFMX order row index → first XM row */
   memset(ordRowToXmRow, -1, sizeof(ordRowToXmRow));
-  int loopJumpXmRow = -1;
-  int loopJumpTargetXmRow = -1;
+  int loopJumpXmRow = -1;       /* XM row where EFFE cmd 1 (loop) was encountered */
+  int loopJumpTargetXmRow = -1; /* XM row the loop jumps back to */
 
   /* TFMX speed = ticks per row. The header stores (speed - 1). */
   int xmSpeed = head.songSpeed[subsong] + 1;
@@ -1083,6 +1093,10 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   /* Resolve mCont chains: if a macro's first action is mCont(target),
    * the effective macro is the target. Build a redirect table so that
    * sample info, effects, and hasOn checks use the resolved macro. */
+  /* Resolve mCont chains: if a macro's first opcode is mCont(target),
+   * the effective instrument is the target macro.  This is common for
+   * wavetable-attack → sustain-sample transitions.  Build a redirect
+   * table so sample info, effects, and hasOn checks use the resolved macro. */
   int macroContTarget[128];
   /* mSKey (split keyboard): stores split note and alternate target.
    * When a macro starts with mSKey, notes >= sKeySplit use sKeyHigh target;
@@ -1283,15 +1297,18 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   }
   printf("---\n\n");
 
-  /* Track which stereo side each instrument plays on so we can bake the
-   * panning into the sample header, freeing the effect column for E9x etc. */
+  /* Per-instrument stereo tracking: count how many notes each instrument
+   * plays on left vs right channels.  Used after simulation to decide
+   * whether panning can be baked into the sample header (single side)
+   * or needs per-note 8xx effects (played on both sides). */
   int instPlayLeft[128];
   int instPlayRight[128];
   memset(instPlayLeft, 0, sizeof(instPlayLeft));
   memset(instPlayRight, 0, sizeof(instPlayRight));
 
-  /* Track the first XM note played for each instrument so we can estimate
-   * the Amiga playback rate at sweep-bake time (Phase 4). */
+  /* Track the first XM note played for each instrument.  This lets the
+   * sweep-bake code (Phase 4) estimate the Amiga DMA playback rate so
+   * the baked waveform length matches the original sweep duration. */
   int instFirstXmNote[128];
   memset(instFirstXmNote, -1, sizeof(instFirstXmNote));
 
@@ -1852,6 +1869,9 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
    * all-right), we bake the panning into the sample header so XM sets it
    * on note trigger.  This frees the effect column for E9x, 0xy, etc.
    * Mixed instruments (played on both sides) fall back to 8xx per note. */
+  /* Decide per-instrument panning strategy:
+   * - All notes on one side → bake into sample header (frees effect column)
+   * - Notes on both sides → mark as needing per-note 8xx pan effect */
   unsigned char instSamplePan[128];
   bool instNeedsPanFx[128];
   for (int i = 0; i < 128; i++) {
@@ -2016,7 +2036,12 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     }
   }
 
-  /* Song-patch: suppress or thin-out notes in specific row ranges. */
+  /* Song-patch: suppress or thin-out notes in specific row ranges.
+   * suppress=true blanks all matching note-ons (replaces the first with
+   * a key-off to cleanly end any prior note, then removes subsequent ones).
+   * minNoteGap>0 enforces a minimum distance between retriggers — notes
+   * that arrive too quickly after the last kept note are blanked.
+   * Both modes also clear any panning effect (8xx) on removed cells. */
   if (patch) {
     for (int c = 0; c < numChans; c++) {
       for (int fi = 0; patch->fixes[fi].channel != -1 || patch->fixes[fi].instrument != -1; fi++) {
@@ -2067,33 +2092,36 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
    * =================================================================== */
 
   for (int ch = 0; ch < numChans; ch++) {
-    bool vibActive = false;
-    bool vibPending = false;
-    bool vibIsReleaseOnly = false;
-    int envSlide = 0;
-    int envDelayLeft = 0;
-    int releaseSlide = 0;
-    int releaseTargetVol = 0;
-    int releaseSlide2 = 0;
-    bool inRelease = false;
-    bool inRelease2 = false;
-    bool autoRelease = false;
-    int sustainTargetVol = 0;
-    int curVibS = 0, curVibD = 0;
-    int runningVol = 0;
-    int stutterOn = 0, stutterOff = 0, stutterVol = 0;
-    int stutterPhase = 0;
-    int stutterDelayLeft = 0;
-    int stutterFadeCycles = 0;
-    int xmTicksPerRow = (xmSpeed > 1) ? (xmSpeed - 1) : 1;
+    /* Per-channel Phase 2 state, reset at each new note-on. */
+    bool vibActive = false;         /* vibrato effect is currently running */
+    bool vibPending = false;        /* vibrato needs to be placed on next free row */
+    bool vibIsReleaseOnly = false;  /* vibrato only starts after pKeyUp */
+    int envSlide = 0;               /* current volume slide speed (neg=down, pos=up) */
+    int envDelayLeft = 0;           /* rows to wait before sustain slide begins */
+    int releaseSlide = 0;           /* release stage 1 slide speed */
+    int releaseTargetVol = 0;       /* volume where release stage 1 stops */
+    int releaseSlide2 = 0;          /* release stage 2 slide (to 0) */
+    bool inRelease = false;         /* true after pKeyUp or auto-release triggered */
+    bool inRelease2 = false;        /* true during release stage 2 (final fade to 0) */
+    bool autoRelease = false;       /* auto-start release when sustain target reached */
+    int sustainTargetVol = 0;       /* volume where sustain slide stops (scaled) */
+    int curVibS = 0, curVibD = 0;   /* current vibrato speed and depth (XM 4xy nibbles) */
+    int runningVol = 0;             /* estimated current volume for envelope tracking */
+    int stutterOn = 0, stutterOff = 0, stutterVol = 0;  /* stutter pulse timing */
+    int stutterPhase = 0;           /* current position within the stutter cycle */
+    int stutterDelayLeft = 0;       /* macro frames to wait before stutter starts */
+    int stutterFadeCycles = 0;      /* cycles until stutter amplitude settles */
+    int xmTicksPerRow = (xmSpeed > 1) ? (xmSpeed - 1) : 1; /* ticks available for slides */
+    /* Determine stereo side for this channel.
+     * Amiga has 4 hardware channels with fixed panning: 0=L, 1=R, 2=R, 3=L.
+     * In 7-voice (multimode), the mapping is different because 8 TFMX
+     * channels are multiplexed onto 4 Paula channels via timesharing. */
     bool isRight;
     if (multimode) {
-      /* 7V channelToVoiceMap: ch→voice = {0,1,2,7,3,4,5,6}
-       * voice→paula = voice & 3.  Paula 1,2 = RIGHT. */
       static const int ch2paula[8] = {0,1,2,3,3,0,1,2};
       isRight = (ch < 8) && (ch2paula[ch] == 1 || ch2paula[ch] == 2);
     } else {
-      isRight = (ch & 1) ^ ((ch & 2) >> 1);  /* Amiga standard: 0,3=L  1,2=R */
+      isRight = (ch & 1) ^ ((ch & 2) >> 1);
     }
     unsigned char panParam = isRight ? panR : panL;
 
@@ -2424,7 +2452,13 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   }
 
   /* Place song loop (Bxx/Dxx) AFTER Phase 2 so panning/vibrato effects
-   * don't overwrite the jump command. */
+   * don't overwrite the jump command.
+   *
+   * TFMX loops via an order-table jump (EFFE cmd 1).  In XM we encode
+   * this as Bxx (jump to pattern) + Dxx (break to row within pattern).
+   * Both commands are placed on the last row before the loop restarts,
+   * in the first channel that has a free effect column.  If no channel
+   * is free, channel 0 (or 1 for Dxx) is overwritten as a last resort. */
   if (loopJumpXmRow >= 0 && loopJumpTargetXmRow >= 0) {
     int srcRow = loopJumpXmRow;
     int dstPat = loopJumpTargetXmRow / ROWS_PER_PAT;
@@ -2470,10 +2504,13 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
    * PHASE 3: Write the XM file.
    * =================================================================== */
 
-  /* Trim unused trailing channels (overflow/stutter channels that are
-   * completely empty).  Scan backwards from the last channel.
-   * gridStride stays at the original allocation width so bigGrid indexing
-   * remains valid; only xmChans (channels written to the file) is reduced. */
+  /* Trim unused trailing channels to keep the XM file compact.
+   * Overflow channels (attack transients) and stutter channels (pulsing
+   * pads) are only used when specific macros require them.  We scan
+   * backwards from the last channel and stop at the first one that
+   * contains any data.  gridStride keeps the original allocation width
+   * so bigGrid indexing stays valid; only xmChans (= written channels)
+   * is reduced. */
   int gridStride = numChans;
   int xmChans = numChans;
   {
@@ -2498,27 +2535,36 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
 
   /* detail info folded into summary line on stdout */
 
-  /* XM header fields (at offset 60, inside the 276-byte header block) */
-  writeU16(out, (unsigned short)songLen);  /* song length in patterns */
+  /* XM header continuation (at file offset 60 + 4, inside the 276-byte block).
+   * These 14 bytes define the global song properties.  restartPos tells the
+   * XM player which pattern to jump to when reaching the end of the order
+   * table — we set it to the pattern containing the TFMX loop target. */
+  writeU16(out, (unsigned short)songLen);  /* song length (number of order entries) */
   int restartPos = (loopJumpTargetXmRow >= 0)
                    ? loopJumpTargetXmRow / ROWS_PER_PAT : 0;
-  writeU16(out, (unsigned short)restartPos); /* restart position */
+  writeU16(out, (unsigned short)restartPos); /* restart position for looping */
   writeU16(out, (unsigned short)xmChans);  /* number of channels */
   writeU16(out, (unsigned short)numPatterns);
-  writeU16(out, 128);                      /* number of instruments */
-  writeU16(out, 1);                        /* flags: 1 = linear frequency table */
-  writeU16(out, (unsigned short)xmSpeed);  /* default speed (ticks/row) */
-  writeU16(out, (unsigned short)xmBPM);   /* default BPM */
+  writeU16(out, 128);                      /* number of instruments (always 128) */
+  writeU16(out, 1);                        /* flags: bit 0 = use linear frequency table */
+  writeU16(out, (unsigned short)xmSpeed);  /* default speed (ticks per row) */
+  writeU16(out, (unsigned short)xmBPM);   /* default tempo (BPM) */
 
-  /* Order table: sequential pattern indices (0, 1, 2, ...) padded to 256 bytes */
+  /* Pattern order table: maps playback order → pattern index.
+   * Since we generate patterns sequentially, order[i] = i.
+   * XM requires exactly 256 bytes here (unused slots are zero). */
   unsigned char order[256];
   memset(order, 0, 256);
   for (int i = 0; i < numPatterns && i < 256; i++) order[i] = (unsigned char)i;
   fwrite(order, 1, 256, out);
 
   /* Write XM patterns with packed cell encoding.
-   * Each cell is either 0x80 (completely empty) or 0x9F followed by all 5
-   * fields (note, instrument, volume, effect type, effect parameter). */
+   * XM supports two cell formats:
+   *   0x80          → completely empty cell (1 byte, saves space)
+   *   0x9F + 5 bytes → full cell: note, instrument, volume, effect, param
+   * We always write the full 6-byte form for non-empty cells (0x9F = all
+   * five fields present).  The bigGrid is sliced into ROWS_PER_PAT (64)
+   * row chunks; each chunk becomes one XM pattern. */
   for (int pi = 0; pi < numPatterns; pi++) {
     int patStart = pi * ROWS_PER_PAT;
     int patEnd = patStart + ROWS_PER_PAT;
@@ -2618,11 +2664,21 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
         snprintf(labelBuf, sizeof(labelBuf), "Instrument %03d", inst + 1);
     }
 
-    signed char* bakedBuf = NULL;
+    signed char* bakedBuf = NULL;  /* non-NULL when sweep baking produces a new sample buffer */
     int bakedLen = 0;
 
-    /* Positive mAddBegin sweep: bake by
-     * concatenating waveform copies at shifted offsets. */
+    /* Positive mAddBegin sweep baking.
+     *
+     * On the Amiga, mAddBegin shifts the DMA read pointer forward through
+     * the sample bank each frame, creating a timbral sweep (wavetable
+     * synthesis).  XM has no per-frame sample-offset modulation, so we
+     * "bake" the sweep by concatenating copies of the waveform at
+     * progressively shifted offsets into a single longer sample.
+     *
+     * The baked sample consists of nLoops copies of the waveform (each
+     * at a different offset), followed by one copy at the settled offset
+     * which becomes the loop body.  RMS normalization ensures the baked
+     * sample has the same perceived loudness as the original. */
     if (atkSrcMacro < 0 && !bakedBuf) {
       MacroSampleInfo& si2 = macroSI[inst];
       if (si2.sweepAmt > 0 && si2.sweepFrames > 0 && smpLen >= 4) {
@@ -2846,7 +2902,9 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
       }
     }
 
-    writeU32(out, 263);  /* instrument header size (including sample header) */
+    /* XM instrument header: 263 = 29 (base) + 234 (extra when numSamples>0).
+     * We always emit exactly one sample per instrument. */
+    writeU32(out, 263);
 
     char instName[22];
     memset(instName, 0, 22);
@@ -2855,29 +2913,35 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     fputc(0, out);          /* instrument type (always 0) */
     writeU16(out, 1);       /* number of samples in this instrument */
 
-    /* Extra header (only present when numSamples > 0) */
+    /* Extra instrument header (present because numSamples = 1).
+     * We don't use XM's built-in volume/panning envelopes — all envelope
+     * behaviour is baked into the pattern data by Phase 2.  So these
+     * fields are zeroed out (disabled). */
     writeU32(out, 40);      /* sample header size */
-    for (int i = 0; i < 96; i++) fputc(0, out);  /* sample-for-note table (all map to sample 0) */
-    for (int i = 0; i < 12; i++) { writeU16(out, 0); writeU16(out, 0); }  /* volume envelope points */
-    for (int i = 0; i < 12; i++) { writeU16(out, 0); writeU16(out, 32); } /* panning envelope points */
+    for (int i = 0; i < 96; i++) fputc(0, out);  /* note-to-sample map (all → sample 0) */
+    for (int i = 0; i < 12; i++) { writeU16(out, 0); writeU16(out, 0); }  /* volume envelope points (unused) */
+    for (int i = 0; i < 12; i++) { writeU16(out, 0); writeU16(out, 32); } /* panning envelope points (unused) */
     fputc(0, out); fputc(0, out);    /* num volume / panning envelope points */
     fputc(0, out); fputc(0, out); fputc(0, out);  /* vol sustain, loop start, loop end */
     fputc(0, out); fputc(0, out); fputc(0, out);  /* pan sustain, loop start, loop end */
     fputc(0, out); fputc(0, out);    /* volume / panning envelope type (0 = disabled) */
     fputc(0, out); fputc(0, out); fputc(0, out); fputc(0, out);  /* vibrato type/sweep/depth/rate */
-    writeU16(out, 256);     /* volume fadeout */
+    writeU16(out, 256);     /* volume fadeout (fast, since we manage fades ourselves) */
     { unsigned char res[22]; memset(res, 0, 22); fwrite(res, 1, 22, out); } /* reserved */
 
-    /* Sample header (40 bytes) */
+    /* Sample header (40 bytes).
+     * Volume is always 64 (max) — actual dynamics are in the pattern data.
+     * relativeNote offsets the playback pitch by mAddNote semitones so
+     * XM note C-4 produces the same frequency as the original TFMX note. */
     writeU32(out, (unsigned int)smpLen);       /* sample length in bytes */
-    writeU32(out, xmLoopStart);               /* loop start */
-    writeU32(out, xmLoopLen);                 /* loop length */
-    fputc(64, out);                           /* default volume (64 = max) */
+    writeU32(out, xmLoopStart);               /* loop start offset */
+    writeU32(out, xmLoopLen);                 /* loop length (0 if no loop) */
+    fputc(64, out);                           /* default volume (always max) */
     fputc(0, out);                            /* finetune (signed, 0 = none) */
     fputc(loopType, out);                     /* 0=none, 1=forward, 2=ping-pong */
-    fputc(instSamplePan[inst], out);           /* panning from tracked channel usage */
-    fputc((unsigned char)relNote, out);       /* relative note */
-    fputc(0, out);                            /* reserved / encoding (0 = delta) */
+    fputc(instSamplePan[inst], out);           /* panning (baked from channel usage) */
+    fputc((unsigned char)relNote, out);       /* relative note (from mAddNote) */
+    fputc(0, out);                            /* encoding: 0 = delta-encoded 8-bit */
     memset(instName, 0, 22);
     { size_t n = strlen(labelBuf); if (n > 22) n = 22; memcpy(instName, labelBuf, n); }
     fwrite(instName, 1, 22, out);
@@ -2900,7 +2964,10 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
       }
     }
 
-    /* Write delta-encoded sample data — no amplitude modification. */
+    /* Write delta-encoded sample data.
+     * XM stores 8-bit samples as deltas: byte[n] = sample[n] - sample[n-1].
+     * If sweep baking produced a bakedBuf, use that; otherwise read
+     * directly from the original TFMX smpl bank. */
     if (bakedBuf) {
       unsigned char* delta = (unsigned char*)malloc((size_t)smpLen);
       if (delta) {
@@ -2922,6 +2989,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   fclose(out);
   free(mdatBuf);
   free(smpl);
-  printf("Converted: %s  Errors %d\n", outPath, xmErrors);
+  printf("Converted: %s  (%d patterns, %d channels, %d rows)  Errors: %d\n",
+         outPath, numPatterns, xmChans, totalXmRows, xmErrors);
   return true;
 }
