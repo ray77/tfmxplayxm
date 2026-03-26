@@ -291,15 +291,19 @@ void printVersion() {
 
 bool parHelp(string) {
   printVersion();
-  printf("usage: tfmxplay [-params] mdat.file [smpl.file]\n");
+  printf("usage: tfmxplay [-params] mdat.file [smpl.file]\n\n");
   for (auto& i: params) {
+    if (i.shortName.empty() && i.name.empty()) {
+      printf("\n%s\n", i.desc.c_str());
+      continue;
+    }
     if (i.value) {
       printf("  -%s %s: %s\n",i.name.c_str(),i.valName.c_str(),i.desc.c_str());
     } else {
       printf("  -%s: %s\n",i.name.c_str(),i.desc.c_str());
     }
   }
-  printf("Runtime keys:\n");
+  printf("\nRuntime keys:\n");
   printf("  Tab: next subsong\n");
   printf("  Shift+Tab: previous subsong\n");
   return false;
@@ -486,18 +490,21 @@ void initParams() {
   params.push_back(Param("v","version",false,parVersion,"","show version"));
   params.push_back(Param("i","info",false,parInfo,"","show TFMX module info (header, subsongs, format)"));
 
+  params.push_back(Param("","",false,NULL,"","Playback:"));
   params.push_back(Param("s","subsong",true,parSong,"(num)","select song"));
   params.push_back(Param("n","ntsc",false,parNTSC,"","use NTSC rate"));
   params.push_back(Param("l","hle",false,parHLE,"","use high-level emulation (lower quality but much faster)"));
   params.push_back(Param("d","dump",false,parDump,"","dump 16-bit stereo output to tfmx.wav"));
   params.push_back(Param("S","speed",true,parSpeed,"","set speed in clock/2 cycles"));
-  params.push_back(Param("c","convert2xm",false,parConvert2XM,"[=file.xm]","convert TFMX to XM file (default: tfmx_<name>.xm)"));
-  params.push_back(Param("p","pan",true,parPan,"(preset)","set XM panning (only with -convert2xm): Amiga (hard L/R), Soft (default, near-original), Headphone (reduced stereo)"));
   params.push_back(Param("M","mute",true,parMute,"(channels)","mute channels (e.g. -M 123 mutes ch 1,2,3)"));
-
 #ifdef _SYNC_VBLANK
   params.push_back(Param("V","vblank",false,parVBlank,"","sync to VBlank"));
 #endif
+
+  params.push_back(Param("","",false,NULL,"","XM Conversion:"));
+  params.push_back(Param("c","convert2xm",false,parConvert2XM,"[=file.xm]","convert TFMX to XM file (default: tfmx_<name>.xm)"));
+  params.push_back(Param("p","pan",true,parPan,"(preset)","panning preset: Amiga (hard L/R), Soft (default), Headphone (reduced stereo)"));
+  params.push_back(Param("","",false,NULL,"","  \x1b[32mExample: tfmxplay mdat.T2_Title -subsong 0 -convert2xm=t2title00.xm -pan=Amiga\x1b[m"));
 }
 
 int main(int argc, char** argv) {
@@ -569,8 +576,7 @@ int main(int argc, char** argv) {
   }
 
   if (mdat=="" && !showInfo) {
-    printVersion();
-    printf("usage: %s [-params] mdat.file [smpl.file]\n",argv[0]);
+    parHelp("");
     return 1;
   }
 
