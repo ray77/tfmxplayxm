@@ -839,14 +839,18 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
 
   /* Stereo panning values for XM effect 8xx (0x00=full left, 0x80=center, 0xFF=full right).
    * Amiga mode reproduces the original hard-panned Amiga sound.
-   * Soft narrows the image slightly for speakers; Headphone narrows further. */
+   * Soft narrows the image slightly for speakers; Headphone narrows further.
+   * NearMono collapses the stereo image to near-center.
+   * ExperimentalBass uses Soft panning but forces bass/drum instruments to center. */
   unsigned char panL, panR;
   switch (pan) {
-    case PAN_AMIGA:    panL = 0x00; panR = 0xFF; break;
-    case PAN_HEADPHONE: panL = 0x30; panR = 0xD0; break;
-    default:           panL = 0x10; panR = 0xF0; break;
+    case PAN_AMIGA:             panL = 0x00; panR = 0xFF; break;
+    case PAN_HEADPHONE:         panL = 0x30; panR = 0xD0; break;
+    case PAN_NEARMONO:          panL = 0x60; panR = 0xA0; break;
+    case PAN_EXPERIMENTAL_BASS: panL = 0x10; panR = 0xF0; break;
+    default:                    panL = 0x10; panR = 0xF0; break;
   }
-  const char* panNames[] = {"Soft","Amiga","Headphone"};
+  const char* panNames[] = {"Soft","Amiga","Headphone","NearMono","ExperimentalBass"};
   printf("Panning preset: %s (L=0x%02X R=0x%02X)\n", panNames[pan], panL, panR);
 
   /* Open conversion.log in the same directory as the output XM file (append mode).
@@ -1419,6 +1423,13 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   memset(instPlayLeft, 0, sizeof(instPlayLeft));
   memset(instPlayRight, 0, sizeof(instPlayRight));
 
+  /* ExperimentalBass: track note sums per instrument to compute average pitch.
+   * Instruments with low average pitch or oneShot+short are panned to center. */
+  long long instNoteSum[128];
+  int instNoteCount[128];
+  memset(instNoteSum, 0, sizeof(instNoteSum));
+  memset(instNoteCount, 0, sizeof(instNoteCount));
+
   /* Track the first XM note played for each instrument.  This lets the
    * sweep-bake code (Phase 4) estimate the Amiga DMA playback rate so
    * the baked waveform length matches the original sweep duration. */
@@ -1794,6 +1805,10 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                       else     instPlayLeft[useInst]++;
                       if (instFirstXmNote[useInst] < 0)
                         instFirstXmNote[useInst] = xmNote;
+                      if (xmNote > 0 && xmNote < 97) {
+                        instNoteSum[useInst] += xmNote;
+                        instNoteCount[useInst]++;
+                      }
                     }
 
                     int macIdx = useInst;
@@ -2012,6 +2027,28 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     }
   }
 
+  /* ExperimentalBass: force bass and drum instruments to center (0x80).
+   * Bass heuristic: average played note <= C-3 (XM note 37) considering
+   * the instrument's relativeNote (addNote) transposition.
+   * Drum heuristic: oneShot sample shorter than 6144 bytes. */
+  bool instCenterPan[128];
+  memset(instCenterPan, 0, sizeof(instCenterPan));
+  if (pan == PAN_EXPERIMENTAL_BASS) {
+    for (int i = 0; i < 128; i++) {
+      if (instNoteCount[i] == 0) continue;
+      int avgNote = (int)(instNoteSum[i] / instNoteCount[i]);
+      int effNote = avgNote + macroSI[i].addNote;
+      bool isBass = (effNote <= 37);
+      bool isDrum = macroSI[i].oneShot && macroSI[i].len > 0 && macroSI[i].len < 6144;
+      if (isBass || isDrum) {
+        instCenterPan[i] = true;
+        instSamplePan[i] = 0x80;
+        if (logFile)
+          fprintf(logFile, "  EXBASS center Inst %d: avgNote=%d addNote=%d effNote=%d %s\n",
+                 i+1, avgNote, macroSI[i].addNote, effNote, isBass ? "BASS" : "DRUM");
+      }
+    }
+  }
 
   /* Look up song-specific patches: name → hash → note fingerprint */
   unsigned int mHash = hashMdat(mdatBuf, mdatSize);
@@ -2378,13 +2415,12 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                    ch, row, noteNames[n % 12], n / 12, idx+1, patVol, effVol, scaledEV);
           }
           runningVol = scaledEV;
-          /* Panning: write 8xx to effect column when free, so panning is
-           * explicit per note.  Use channel-derived panParam (left/right).
-           * For mixed instruments we use panParam; for single-side we also
-           * use panParam so the effect column matches the channel. */
+          /* Panning: write 8xx to effect column when free.  ExperimentalBass
+           * overrides bass/drum instruments to center (0x80); all others use
+           * the channel-derived panParam (left/right). */
           if (cell->fx == 0) {
             cell->fx = 8;
-            cell->param = panParam;
+            cell->param = (idx >= 0 && idx < 128 && instCenterPan[idx]) ? 0x80 : panParam;
           }
 
           /* Vibrato: place directly on the note row when the effect column

@@ -473,8 +473,10 @@ bool parPan(string v) {
   if (v=="Amiga" || v=="amiga") panPreset=PAN_AMIGA;
   else if (v=="Soft" || v=="soft") panPreset=PAN_SOFT;
   else if (v=="Headphone" || v=="headphone") panPreset=PAN_HEADPHONE;
+  else if (v=="NearMono" || v=="nearmono") panPreset=PAN_NEARMONO;
+  else if (v=="ExperimentalBass" || v=="experimentalbass") panPreset=PAN_EXPERIMENTAL_BASS;
   else {
-    printf("unknown pan preset: %s (use Amiga, Soft, or Headphone)\n",v.c_str());
+    printf("unknown pan preset: %s (use Amiga, Soft, Headphone, NearMono, ExperimentalBass)\n",v.c_str());
     return false;
   }
   return true;
@@ -503,7 +505,7 @@ void initParams() {
 
   params.push_back(Param("","",false,NULL,"","XM Conversion:"));
   params.push_back(Param("c","convert2xm",false,parConvert2XM,"[=file.xm]","convert TFMX to XM file (default: tfmx_<name>.xm)"));
-  params.push_back(Param("p","pan",true,parPan,"(preset)","panning preset: Amiga (hard L/R), Soft (default), Headphone (reduced stereo)"));
+  params.push_back(Param("p","pan",true,parPan,"(preset)","panning: Amiga, Soft (default), Headphone, NearMono, ExperimentalBass"));
   params.push_back(Param("","",false,NULL,"","  \x1b[32mExample: tfmxplay mdat.T2_Title -subsong 0 -convert2xm=t2title00.xm -pan=Amiga\x1b[m"));
 }
 
