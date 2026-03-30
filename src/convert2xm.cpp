@@ -35,6 +35,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 #ifndef _WIN32
 #include <arpa/inet.h>
 #endif
@@ -174,6 +175,11 @@ static const SongPatch songPatches[] = {
     {  1,  54,   -1,  -1,   12,   -1,   -1,  -1, false }, /* Ch01 Inst54 bass: note-off after 12 rows silence */
     { -1,  -1,   -1,  -1,   -1,   -1,   -1,  -1, false },
   }},
+  { "mdat.title",     0xb2eae944u, 0xcde8a36fu, 0, "T1_Title", {
+    { -1,  29,   -1,  -1,   -1,   42,   -1,  -1, false }, /* Drums (Inst29/Macro28): cap volume */
+    { -1,  24,   -1,  -1,   -1,   35,   -1,  -1, false }, /* Transient (Inst24/Macro23): cap volume */
+    { -1,  -1,   -1,  -1,   -1,   -1,   -1,  -1, false },
+  }},
   { "mdat.T2_World2", 0x12a3f169u, 0xdaf49cf2u, 0, "T2_World2 Sub00", {
     {  0,  -1,    0,   1,   -1,    0,   -1,  -1, false }, /* Ch00 row0: vol=0 to kill loop bleed */
     { -1,  -1,   -1,  -1,   -1,   -1,   -1,  -1, false },
@@ -279,6 +285,7 @@ struct MacroEffectInfo {
   int stutterVol;       /* volume during the "on" phase of stutter (0-64) */
   int stutterDelay;     /* macro frames before stutter loop starts */
   int stutterFadeCycles;/* cycles until stutter silences (from mAddBegin) */
+  int retriggerFrames;  /* frames per DMA retrigger cycle (mOff/mOn in loop); 0 = none */
 };
 
 /*
@@ -327,6 +334,7 @@ static MacroSampleInfo getMacroSample(const TFMXMacroData macro[256]) {
           firstOnStart = curStart;
           firstOnLen = curLenWords;
           hadFirstOn = true;
+        
         }
         onStart = curStart;
         onLen = curLenWords;
@@ -507,7 +515,7 @@ static int calcEnvSpeed(int envAmt, int envTimeC, int xmSpeed) {
  */
 static MacroEffectInfo getMacroEffects(const TFMXMacroData allMacros[128][256],
                                        int macroIdx, int xmSpeed) {
-  MacroEffectInfo fx = {-999, -1, 0, 0, false, 0, 0, 0, 0, 0, 0, false, 0, 0, 0, 0, 0};
+  MacroEffectInfo fx = {-999, -1, 0, 0, false, 0, 0, 0, 0, 0, 0, false, 0, 0, 0, 0, 0, 0};
   bool foundVib = false;
   bool afterOn = false;
   bool afterWaitUp = false;
@@ -722,6 +730,35 @@ efxdone:
     }
   }
 
+  /* Detect macro-internal retrigger: mOff + mOn inside a mLoop body.
+   * TFMX macros use this to create repeating pluck effects (e.g. T1 leads).
+   * The retrigger interval = total mWait frames in the loop body + 1. */
+  {
+    const TFMXMacroData* origMacro = allMacros[macroIdx];
+    bool seenOn = false;
+    for (int i = 0; i < 256; i++) {
+      if (origMacro[i].op == mStop) break;
+      if (origMacro[i].op == mOn) seenOn = true;
+      if (seenOn && origMacro[i].op == mLoop) {
+        int loopTarget = origMacro[i].data[2];
+        if (loopTarget < 0 || loopTarget >= i) continue;
+        bool hasOff = false, hasOn = false;
+        int waitFrames = 0;
+        for (int j = loopTarget; j < i; j++) {
+          if (origMacro[j].op == mOff || origMacro[j].op == mOffReset) hasOff = true;
+          if (origMacro[j].op == mOn) hasOn = true;
+          if (origMacro[j].op == mWait) {
+            int w = (origMacro[j].data[0]<<16)|(origMacro[j].data[1]<<8)|origMacro[j].data[2];
+            waitFrames += w + 1;
+          }
+        }
+        if (hasOff && hasOn && waitFrames > 0)
+          fx.retriggerFrames = waitFrames;
+        break;
+      }
+    }
+  }
+
   return fx;
 }
 
@@ -812,10 +849,74 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   const char* panNames[] = {"Soft","Amiga","Headphone"};
   printf("Panning preset: %s (L=0x%02X R=0x%02X)\n", panNames[pan], panL, panR);
 
+  /* Open conversion.log in the same directory as the output XM file (append mode).
+   * All detailed diagnostic output (macro info, sample stats, note events) goes
+   * here to keep the console output concise. */
+  char logPath[1024];
+  {
+    const char* lastSlash = strrchr(outPath, '/');
+    if (lastSlash) {
+      size_t dirLen = (size_t)(lastSlash - outPath);
+      if (dirLen >= sizeof(logPath)) dirLen = sizeof(logPath) - 1;
+      memcpy(logPath, outPath, dirLen);
+      logPath[dirLen] = '\0';
+    } else {
+      logPath[0] = '.'; logPath[1] = '\0';
+    }
+    strncat(logPath, "/conversion.log", sizeof(logPath) - strlen(logPath) - 1);
+  }
+
+  /* Log rotation: if conversion.log exceeds ~1 MB, rotate to numbered archives.
+   * conversion.log → conversion_old_01.log, shifting existing archives up.
+   * Maximum 9 archives; the oldest (conversion_old_09.log) is deleted. */
+  {
+    FILE* probe = fopen(logPath, "rb");
+    if (probe) {
+      fseek(probe, 0, SEEK_END);
+      long sz = ftell(probe);
+      fclose(probe);
+      if (sz >= 1024 * 1024) {
+        char dirBuf[1024];
+        const char* ls = strrchr(logPath, '/');
+        if (ls) {
+          size_t dl = (size_t)(ls - logPath);
+          if (dl >= sizeof(dirBuf)) dl = sizeof(dirBuf) - 1;
+          memcpy(dirBuf, logPath, dl);
+          dirBuf[dl] = '\0';
+        } else {
+          dirBuf[0] = '.'; dirBuf[1] = '\0';
+        }
+        char oldPath[1024], newPath[1024];
+        snprintf(oldPath, sizeof(oldPath), "%s/conversion_old_09.log", dirBuf);
+        remove(oldPath);
+        for (int n = 8; n >= 1; n--) {
+          snprintf(oldPath, sizeof(oldPath), "%s/conversion_old_%02d.log", dirBuf, n);
+          snprintf(newPath, sizeof(newPath), "%s/conversion_old_%02d.log", dirBuf, n + 1);
+          rename(oldPath, newPath);
+        }
+        snprintf(newPath, sizeof(newPath), "%s/conversion_old_01.log", dirBuf);
+        rename(logPath, newPath);
+      }
+    }
+  }
+
+  FILE* logFile = fopen(logPath, "a");
+  if (logFile) {
+    time_t now = time(NULL);
+    struct tm* t = localtime(&now);
+    char timeBuf[64];
+    strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%d %H:%M:%S", t);
+    fprintf(logFile, "\n========================================\n");
+    fprintf(logFile, "[%s] Convert: %s → %s  (subsong %d)\n", timeBuf, mdatPath, outPath, subsong);
+    fprintf(logFile, "Panning: %s (L=0x%02X R=0x%02X)\n", panNames[pan], panL, panR);
+    fprintf(logFile, "========================================\n");
+  }
+
   /* Load smpl */
   f = fopen(smplPath, "rb");
   if (!f) {
     perror(smplPath);
+    if (logFile) fclose(logFile);
     return false;
   }
   fseek(f, 0, SEEK_END);
@@ -824,6 +925,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   smpl = (signed char*)malloc(smplLen);
   if (!smpl) {
     fclose(f);
+    if (logFile) fclose(logFile);
     return false;
   }
   fread(smpl, 1, smplLen, f);
@@ -836,6 +938,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   if (!f) {
     perror(mdatPath);
     free(smpl);
+    if (logFile) fclose(logFile);
     return false;
   }
   fseek(f, 0, SEEK_END);
@@ -845,6 +948,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   if (!mdatBuf) {
     fclose(f);
     free(smpl);
+    if (logFile) fclose(logFile);
     return false;
   }
   fread(mdatBuf, 1, mdatSize, f);
@@ -856,6 +960,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   if (mdatSize < 512) {
     free(mdatBuf);
     free(smpl);
+    if (logFile) fclose(logFile);
     return false;
   }
   memcpy(&head, mdatBuf, sizeof(head));
@@ -933,6 +1038,8 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   int startRow = head.songStart[subsong];
   int endRow = head.songEnd[subsong];
   if (startRow < 0) startRow = 0;
+  if (startRow > 127) startRow = 127;
+  if (endRow > 127) endRow = 127;
   if (endRow < startRow) endRow = startRow;
 
   bool multimode = false;
@@ -957,6 +1064,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     perror(outPath);
     free(mdatBuf);
     free(smpl);
+    if (logFile) fclose(logFile);
     return false;
   }
 
@@ -993,7 +1101,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   int numChans = BASE_CHANS + OVERFLOW_CHANS + STUTTER_CHANS;
 
   XMCell* bigGrid = (XMCell*)calloc((size_t)MAX_TOTAL_ROWS * numChans, sizeof(XMCell));
-  if (!bigGrid) { fclose(out); free(mdatBuf); free(smpl); return false; }
+  if (!bigGrid) { fclose(out); free(mdatBuf); free(smpl); if (logFile) fclose(logFile); return false; }
 
   /*
    * Per-track simulation state. TFMX has 8 "tracks" that run patterns
@@ -1243,27 +1351,30 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     }
   }
 
-  /* Diagnostic: dump full volume/envelope info for active macros */
-  printf("\n--- Volume Diagnostics (full) ---\n");
-  for (int i = 0; i < 128; i++) {
-    if (macroFX[i].addVol != -999 || macroFX[i].setVol >= 0 ||
-        macroSI[i].sweepAmt != 0) {
-      MacroEffectInfo& ef = macroFX[i];
-      printf("  Macro %3d: addVol=%4d  setVol=%3d  sweep=%d"
-             "  susSlide=%d susTarget=%d susDelay=%d"
-             "  relSlide=%d relTarget=%d relSlide2=%d autoRel=%d"
-             "  stutOn=%d stutOff=%d stutVol=%d\n",
-             i, ef.addVol, ef.setVol, macroSI[i].sweepAmt,
-             ef.sustainSlide, ef.sustainTarget, ef.sustainDelay,
-             ef.releaseSlide, ef.releaseTarget, ef.releaseSlide2,
-             ef.autoRelease ? 1 : 0,
-             ef.stutterOnFrames, ef.stutterOffFrames, ef.stutterVol);
+  /* Diagnostic: dump full volume/envelope info for active macros → log */
+  if (logFile) {
+    fprintf(logFile, "\n--- Volume Diagnostics (full) ---\n");
+    for (int i = 0; i < 128; i++) {
+      if (macroFX[i].addVol != -999 || macroFX[i].setVol >= 0 ||
+          macroSI[i].sweepAmt != 0) {
+        MacroEffectInfo& ef = macroFX[i];
+        fprintf(logFile, "  Macro %3d: addVol=%4d  setVol=%3d  sweep=%d"
+               "  susSlide=%d susTarget=%d susDelay=%d"
+               "  relSlide=%d relTarget=%d relSlide2=%d autoRel=%d"
+               "  stutOn=%d stutOff=%d stutVol=%d  retrig=%d\n",
+               i, ef.addVol, ef.setVol, macroSI[i].sweepAmt,
+               ef.sustainSlide, ef.sustainTarget, ef.sustainDelay,
+               ef.releaseSlide, ef.releaseTarget, ef.releaseSlide2,
+               ef.autoRelease ? 1 : 0,
+               ef.stutterOnFrames, ef.stutterOffFrames, ef.stutterVol,
+               ef.retriggerFrames);
+      }
     }
+    fprintf(logFile, "---\n\n");
   }
-  printf("---\n\n");
 
-  /* Diagnostic: dump raw macro steps for key macros */
-  {
+  /* Diagnostic: dump raw macro steps for key macros → log */
+  if (logFile) {
     static const char* opNames[] = {
       "mOffReset","mOn","mSetBegin","mSetLen","mWait","mLoop","mCont","mStop",
       "mAddNote","mSetNote","mReset","mPorta","mVibrato","mAddVol","mSetVol",
@@ -1271,31 +1382,33 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
       "mSetPeriod","mSetLoop","mOneShot","mWaitSample","mRand","mSKey","mSVol",
       "mAddVolNote","mSetPrevNote","mSignal","mPlayMacro"
     };
-    printf("--- Raw Macro Steps (key macros) ---\n");
+    fprintf(logFile, "--- Raw Macro Steps (key macros) ---\n");
     int dumpMacros[] = {53, 54, 62, 63, -1};
     for (int dm = 0; dumpMacros[dm] >= 0; dm++) {
       int m = dumpMacros[dm];
-      printf("  Macro %d:\n", m);
+      fprintf(logFile, "  Macro %d:\n", m);
       for (int s = 0; s < 30; s++) {
         int op = macro[m][s].op;
         const char* name = (op < 34) ? opNames[op] : "???";
-        printf("    %2d: %-12s (%02X %02X %02X)\n", s, name,
+        fprintf(logFile, "    %2d: %-12s (%02X %02X %02X)\n", s, name,
                macro[m][s].data[0], macro[m][s].data[1], macro[m][s].data[2]);
         if (op == mStop || op == mLoop) break;
       }
     }
-    printf("---\n\n");
+    fprintf(logFile, "---\n\n");
   }
 
-  /* Diagnostic: attack overflow instruments */
-  printf("--- Attack Overflow Instruments ---\n");
-  for (int i = 0; i < 128; i++) {
-    if (atkInstMap[i] > 0)
-      printf("  Macro %3d -> Attack Inst %d (atkStart=%d atkLen=%d smpStart=%d smpLen=%d setNote=%d)\n",
-             i, atkInstMap[i], macroSI[i].atkStart, macroSI[i].atkLen,
-             macroSI[i].start, macroSI[i].len, macroSI[i].setNoteVal);
+  /* Diagnostic: attack overflow instruments → log */
+  if (logFile) {
+    fprintf(logFile, "--- Attack Overflow Instruments ---\n");
+    for (int i = 0; i < 128; i++) {
+      if (atkInstMap[i] > 0)
+        fprintf(logFile, "  Macro %3d -> Attack Inst %d (atkStart=%d atkLen=%d smpStart=%d smpLen=%d setNote=%d)\n",
+               i, atkInstMap[i], macroSI[i].atkStart, macroSI[i].atkLen,
+               macroSI[i].start, macroSI[i].len, macroSI[i].setNoteVal);
+    }
+    fprintf(logFile, "---\n\n");
   }
-  printf("---\n\n");
 
   /* Per-instrument stereo tracking: count how many notes each instrument
    * plays on left vs right channels.  Used after simulation to decide
@@ -1422,6 +1535,12 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     }
 
     ordRowToXmRow[ordRow] = totalXmRows;
+    if (logFile) {
+      fprintf(logFile, "  ORD %3d → xmRow %5d  pats:", ordRow, totalXmRows);
+      for (int t = 0; t < 8; t++)
+        fprintf(logFile, " %02X/%+d", track[ordRow][t].pat, (signed char)track[ordRow][t].trans);
+      fprintf(logFile, "\n");
+    }
     initOrderRow(ordRow);
 
     /* Tick loop for this order row. Each iteration = one XM row.
@@ -1612,7 +1731,10 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                 /* Regular note event. TFMX note = 6-bit pitch + transposition.
                  * The +25 offset maps TFMX notes to XM so that the effective
                  * playback frequency (after per-instrument relativeNote from
-                 * mAddNote) matches the original TFMX NTSC period within 0.2%. */
+                 * mAddNote) matches the original TFMX NTSC period within 0.1%.
+                 * Derivation: TFMX freq = 3579545 * 2^(N/12) / 2033.83
+                 *             XM freq   = 8363 * 2^((xmNote-49)/12)
+                 *             Solving: xmNote = tfmxNote + 25 */
                 int rawNote = (item.note & 0x3f) + ts[t].trans;
                 int xmNote = rawNote + 25;
                 if (xmNote < 1) xmNote = 1;
@@ -1897,8 +2019,92 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   const char* matchMethod = NULL;
   const SongPatch* patch = findSongPatch(mdatPath, mHash, noteFP, subsong, &matchMethod);
   printf("mdat: %s  hash: 0x%08x  noteFP: 0x%08x\n", basenameOf(mdatPath), mHash, noteFP);
-  if (patch)
+  if (logFile) {
+    fprintf(logFile, "\nmdat: %s  hash: 0x%08x  noteFP: 0x%08x\n", basenameOf(mdatPath), mHash, noteFP);
+  }
+  if (patch) {
     printf("Song patch active: %s (matched by %s)\n", patch->label, matchMethod);
+    if (logFile)
+      fprintf(logFile, "Song patch active: %s (matched by %s)\n", patch->label, matchMethod);
+  }
+
+  /* Per-song attack prepend table: some macros have a short attack sample
+   * (different smpl region) before the sustain body, but without mSetNote.
+   * The attack is prepended to the sustain only for songs/macros listed here. */
+  bool atkPrepend[128]; memset(atkPrepend, 0, sizeof(atkPrepend));
+  int  atkPrependOff[128]; memset(atkPrependOff, 0, sizeof(atkPrependOff));
+  int  atkPrependLen[128]; memset(atkPrependLen, 0, sizeof(atkPrependLen));
+
+  if (patch && strcmp(patch->label, "T1_Title") == 0) {
+    atkPrepend[28]    = true;   /* macro 28 = drum: attack at 0x1C14, 512 bytes */
+    atkPrependOff[28] = 0x1C14;
+    atkPrependLen[28] = 512;
+
+    /* Macro 23 (Inst 24): mOn/mWait opcode mismatch causes the converter to
+     * misidentify the DMA-restart loop as a multi-frame sweep.  In reality,
+     * all 14 iterations execute within a single Amiga frame — the macro is a
+     * one-shot transient, not a sustained pad.  Disable the bogus sweep and
+     * set the sample to the final (settled) DMA position. */
+    if (macroSI[23].sweepAmt > 0) {
+      int totalIter = macroSI[23].sweepFrames + 1;
+      int settled = macroSI[23].sweepAmt * totalIter;
+      macroSI[23].start += settled;
+      macroSI[23].sweepAmt = 0;
+      macroSI[23].sweepFrames = 0;
+      macroSI[23].oneShot = true;
+    }
+  }
+
+  /* T1_Title retrigger expansion: macros with internal DMA loops (mOff/mOn
+   * in mLoop) produce repeated note-ons.  Only applied when the T1_Title
+   * song patch is active to avoid affecting other songs. */
+  if (patch && strcmp(patch->label, "T1_Title") == 0) {
+    int framesPerRow = speedWasDoubled ? 1 : xmSpeed;
+    for (int c = 0; c < BASE_CHANS; c++) {
+      for (int row = 0; row < totalXmRows; row++) {
+        XMCell* cell = &bigGrid[row * numChans + c];
+        if (cell->note < 1 || cell->note >= 97 || cell->inst < 1) continue;
+        int macIdx = cell->inst - 1;
+        if (macIdx < 0 || macIdx >= 128) continue;
+        int retrigFrames = macroFX[macIdx].retriggerFrames;
+        if (retrigFrames < 2) continue;
+
+        int retrigRows = (retrigFrames + framesPerRow / 2) / framesPerRow;
+        if (retrigRows < 1) retrigRows = 1;
+
+        int nextEventRow = totalXmRows;
+        for (int r = row + 1; r < totalXmRows; r++) {
+          XMCell* nc = &bigGrid[r * numChans + c];
+          if ((nc->note > 0 && nc->inst > 0) || nc->note == 97) {
+            nextEventRow = r; break;
+          }
+        }
+        int gap = nextEventRow - row;
+        int numRetrig = (gap - 1) / retrigRows;
+        if (numRetrig < 1) { row = nextEventRow - 1; continue; }
+
+        int baseVol = (int)cell->vol - 0x10;
+        if (baseVol < 0) baseVol = 0;
+        int minVol = baseVol / 5;
+        if (minVol < 4) minVol = 4;
+
+        for (int i = 1; i <= numRetrig; i++) {
+          int rr = row + i * retrigRows;
+          if (rr >= nextEventRow || rr >= totalXmRows) break;
+          XMCell* rc = &bigGrid[rr * numChans + c];
+          if (rc->note > 0 || rc->inst > 0) break;
+          float t = (float)i / (float)(numRetrig + 1);
+          int decVol = baseVol - (int)((float)(baseVol - minVol) * t);
+          if (decVol < minVol) decVol = minVol;
+          rc->note = cell->note;
+          rc->inst = cell->inst;
+          rc->vol  = (unsigned char)(0x10 + decVol);
+          if (rc->vol > 0x50) rc->vol = 0x50;
+        }
+        row = nextEventRow - 1;
+      }
+    }
+  }
 
   /* Orphan-note cleanup.  In multimode, notes that receive no events for
    * a long span are likely orphaned.  Insert a key-off so Phase 2 can
@@ -2165,9 +2371,12 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
             }
           }
           cell->vol = (unsigned char)(0x10 + scaledEV);
-          /* Diagnostic: note-on volume trace */
-          printf("  NOTE ch=%d row=%d inst=%d vel=%d effVol=%d scaled=%d\n",
-                 ch, row, idx+1, patVol, effVol, scaledEV);
+          if (logFile) {
+            static const char* noteNames[] = {"C-","C#","D-","D#","E-","F-","F#","G-","G#","A-","A#","B-"};
+            int n = cell->note - 1;
+            fprintf(logFile, "  NOTE ch=%d row=%d  %s%d  inst=%d vel=%d effVol=%d scaled=%d\n",
+                   ch, row, noteNames[n % 12], n / 12, idx+1, patVol, effVol, scaledEV);
+          }
           runningVol = scaledEV;
           /* Panning: write 8xx to effect column when free, so panning is
            * explicit per note.  Use channel-derived panParam (left/right).
@@ -2573,7 +2782,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     if (patRows < 1) patRows = 1;
 
     unsigned char* packed = (unsigned char*)malloc((size_t)(patRows * xmChans * 6));
-    if (!packed) { free(bigGrid); fclose(out); free(mdatBuf); free(smpl); return false; }
+    if (!packed) { free(bigGrid); fclose(out); free(mdatBuf); free(smpl); if (logFile) fclose(logFile); return false; }
     unsigned char* p = packed;
     for (int row = patStart; row < patStart + patRows; row++) {
       for (int ch = 0; ch < xmChans; ch++) {
@@ -2666,6 +2875,30 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
 
     signed char* bakedBuf = NULL;  /* non-NULL when sweep baking produces a new sample buffer */
     int bakedLen = 0;
+
+    /* Song-patch attack prepend: some macros have a short attack transient
+     * (different sample region) followed by the sustain body, but without
+     * mSetNote.  The attack is prepended only when flagged by a song patch. */
+    if (atkSrcMacro < 0 && atkPrepend[inst]) {
+      int atkOff = atkPrependOff[inst];
+      int atkSz  = atkPrependLen[inst];
+      if (atkOff >= 0 && atkSz >= 4 && atkOff + atkSz <= (int)smplLen) {
+        int totalLen = atkSz + smpLen;
+        signed char* combined = (signed char*)malloc((size_t)totalLen);
+        if (combined) {
+          memcpy(combined, smpl + atkOff, (size_t)atkSz);
+          memcpy(combined + atkSz, smpl + smpStart, (size_t)smpLen);
+          bakedBuf = combined;
+          bakedLen = totalLen;
+          if (loopType != 0)
+            xmLoopStart += (unsigned int)atkSz;
+          smpLen = totalLen;
+          if (logFile)
+            fprintf(logFile, "  ATK PREPEND Inst %d: atkOff=0x%X atkSz=%d susOff=0x%X susSz=%d total=%d\n",
+                   inst+1, atkOff, atkSz, smpStart, smpLen - atkSz, totalLen);
+        }
+      }
+    }
 
     /* Positive mAddBegin sweep baking.
      *
@@ -2795,11 +3028,13 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
             }
             double bakedRms = sqrt(bakedSumSq / totalLen);
 
-            printf("  SWEEP BAKE Inst %d: origLen=%d origRms=%.1f bakedLen=%d bakedRms=%.1f",
-                   inst+1, origLen, origRms, totalLen, bakedRms);
+            if (logFile) {
+              fprintf(logFile, "  SWEEP BAKE Inst %d: origLen=%d origRms=%.1f bakedLen=%d bakedRms=%.1f",
+                     inst+1, origLen, origRms, totalLen, bakedRms);
+            }
             if (bakedRms > origRms && bakedRms > 1.0) {
               double scale = origRms / bakedRms;
-              printf(" -> NORM scale=%.3f\n", scale);
+              if (logFile) fprintf(logFile, " -> NORM scale=%.3f\n", scale);
               for (int k = 0; k < totalLen; k++) {
                 int v = (int)(bakedBuf[k] * scale);
                 if (v > 127) v = 127;
@@ -2807,7 +3042,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                 bakedBuf[k] = (signed char)v;
               }
             } else {
-              printf(" -> SKIP (no norm needed)\n");
+              if (logFile) fprintf(logFile, " -> SKIP (no norm needed)\n");
             }
           }
         }
@@ -2895,8 +3130,9 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
               xmLoopLen = (unsigned int)totalLen - xmLoopStart;
             smpLen = totalLen;
 
-            printf("  SWEEP ATK PREFIX Inst %d: atkLen=%d sweepFrames=%d atkBaked=%d sustainLen=%d total=%d\n",
-                   inst+1, atkOrigLen, nFrames, atkBakedLen, smpLen - atkBakedLen, totalLen);
+            if (logFile)
+              fprintf(logFile, "  SWEEP ATK PREFIX Inst %d: atkLen=%d sweepFrames=%d atkBaked=%d sustainLen=%d total=%d\n",
+                     inst+1, atkOrigLen, nFrames, atkBakedLen, smpLen - atkBakedLen, totalLen);
           }
         }
       }
@@ -2946,11 +3182,11 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     { size_t n = strlen(labelBuf); if (n > 22) n = 22; memcpy(instName, labelBuf, n); }
     fwrite(instName, 1, 22, out);
 
-    /* Diagnostic: compute and print sample RMS */
+    /* Diagnostic: compute and log sample RMS / Peak */
     {
       const signed char* smpData = bakedBuf ? bakedBuf : (const signed char*)(smpl + smpStart);
       int smpDiagLen = smpLen;
-      if (smpDiagLen > 0) {
+      if (smpDiagLen > 0 && logFile) {
         double sumSq = 0;
         int peak = 0;
         for (int k = 0; k < smpDiagLen; k++) {
@@ -2959,7 +3195,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
           if (abs(v) > peak) peak = abs(v);
         }
         double rms = sqrt(sumSq / smpDiagLen);
-        printf("  SMP Inst %3d: len=%6d  RMS=%5.1f  Peak=%4d  pan=0x%02X  %s\n",
+        fprintf(logFile, "  SMP Inst %3d: len=%6d  RMS=%5.1f  Peak=%4d  pan=0x%02X  %s\n",
                inst + 1, smpDiagLen, rms, peak, instSamplePan[inst], labelBuf);
       }
     }
@@ -2991,5 +3227,11 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   free(smpl);
   printf("Converted: %s  (%d patterns, %d channels, %d rows)  Errors: %d\n",
          outPath, numPatterns, xmChans, totalXmRows, xmErrors);
+  if (logFile) {
+    fprintf(logFile, "\nConverted: %s  (%d patterns, %d channels, %d rows)  Errors: %d\n",
+           outPath, numPatterns, xmChans, totalXmRows, xmErrors);
+    fclose(logFile);
+    printf("  More info in: %s\n", logPath);
+  }
   return true;
 }
