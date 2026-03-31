@@ -16,27 +16,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build SDL2 universal static
+      - name: Build and install SDL2 universal static
         run: |
           curl -fSL "https://github.com/libsdl-org/SDL/releases/download/release-${SDL2_VERSION}/SDL2-${SDL2_VERSION}.tar.gz" | tar xz
           cd SDL2-${SDL2_VERSION}
-          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+          cmake -B build -G "Unix Makefiles" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/sdl2-prefix" \
             -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET="10.15" \
             -DSDL_SHARED=OFF -DSDL_STATIC=ON \
             -DSDL_TEST=OFF -DSDL_ASSEMBLY=OFF
-          cmake --build build --config Release -- -j$(sysctl -n hw.ncpu)
+          cmake --build build -j$(sysctl -n hw.ncpu)
+          cmake --install build
+          echo "=== Installed SDL2 ==="
+          find ${GITHUB_WORKSPACE}/sdl2-prefix -name "*.a" -o -name "SDL.h" | head -10
 
       - name: Build tfmxplay universal
         run: |
-          SDL2_DIR="${GITHUB_WORKSPACE}/SDL2-${SDL2_VERSION}"
-          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+          PREFIX="${GITHUB_WORKSPACE}/sdl2-prefix"
+          cmake -B build -G "Unix Makefiles" \
+            -DCMAKE_BUILD_TYPE=Release \
             -DSTATIC_BUILD=ON \
             -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET="10.15" \
-            -DSDL2_STATIC_LIB="${SDL2_DIR}/build/libSDL2.a" \
-            -DSDL2_INCLUDE_DIR="${SDL2_DIR}/include"
-          cmake --build build --config Release -- -j$(sysctl -n hw.ncpu)
+            -DSDL2_STATIC_LIB="${PREFIX}/lib/libSDL2.a" \
+            -DSDL2_INCLUDE_DIR="${PREFIX}/include/SDL2"
+          cmake --build build -j$(sysctl -n hw.ncpu)
           strip build/tfmxplay
 
       - name: Verify binary
