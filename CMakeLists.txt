@@ -4,9 +4,9 @@ project(tfmxplay VERSION 0.0.7)
 # are you kidding me?! macOS 10.15 and still no C++11 by default?!
 set(CMAKE_CXX_STANDARD 11)
 
+option(STATIC_BUILD "Build fully static executable (no external dylibs)" OFF)
+
 if (WIN32 AND MINGW)
-  # MinGW: use system-installed SDL2 (e.g. via pacman)
-  option(STATIC_BUILD "Build fully static executable" OFF)
   if (STATIC_BUILD)
     find_library(HAVE_SDL2 libSDL2.a)
   else()
@@ -16,8 +16,15 @@ if (WIN32 AND MINGW)
 elseif (WIN32)
   add_subdirectory(SDL)
   set(HAVE_SDL2 SDL2-static)
+elseif (APPLE AND STATIC_BUILD)
+  set(SDL2_STATIC_LIB "${CMAKE_BINARY_DIR}/libSDL2-universal.a" CACHE FILEPATH
+      "Path to universal (arm64+x86_64) SDL2 static library")
+  if (NOT SDL2_INCLUDE_DIR)
+    find_path(SDL2_INCLUDE_DIR SDL.h
+      HINTS /opt/homebrew/include /usr/local/include
+      PATH_SUFFIXES SDL2)
+  endif()
 else()
-  # macOS Apple Silicon: prefer Homebrew (arm64) over /usr/local (x86)
   if (APPLE AND CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
     set(CMAKE_FIND_USE_CMAKE_SYSTEM_PATH OFF)
     list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew")
@@ -49,13 +56,27 @@ endif()
 
 if (WIN32 AND MINGW)
   if (STATIC_BUILD)
-    target_link_libraries(tfmxplay -static mingw32 SDL2main ${HAVE_SDL2}
+    target_link_libraries(tfmxplay -static -static-libgcc -static-libstdc++
+      mingw32 SDL2main ${HAVE_SDL2}
+      dinput8 dxguid dxerr8 hid cfgmgr32 uuid
       imm32 ole32 oleaut32 version winmm gdi32 setupapi user32 advapi32 shell32)
   else()
     target_link_libraries(tfmxplay mingw32 SDL2main ${HAVE_SDL2})
   endif()
 elseif (WIN32)
   target_link_libraries(tfmxplay SDL2main ${HAVE_SDL2})
+elseif (APPLE AND STATIC_BUILD)
+  target_link_libraries(tfmxplay
+    ${SDL2_STATIC_LIB}
+    "-framework CoreAudio" "-framework AudioToolbox"
+    "-framework CoreVideo" "-framework Cocoa"
+    "-framework Carbon" "-framework IOKit"
+    "-framework ForceFeedback"
+    "-weak_framework CoreHaptics"
+    "-weak_framework GameController"
+    "-weak_framework QuartzCore"
+    "-weak_framework Metal"
+    -lobjc -lm -liconv)
 else()
   target_link_libraries(tfmxplay ${HAVE_SDL2})
 endif()

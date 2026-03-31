@@ -1,0 +1,122 @@
+name: Release Build
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  SDL2_VERSION: "2.30.9"
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build SDL2 universal static
+        run: |
+          curl -fSL "https://github.com/libsdl-org/SDL/releases/download/release-${SDL2_VERSION}/SDL2-${SDL2_VERSION}.tar.gz" | tar xz
+          cd SDL2-${SDL2_VERSION}
+          mkdir build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="10.15" \
+            -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST=OFF
+          make -j$(sysctl -n hw.ncpu)
+
+      - name: Build tfmxplay universal
+        run: |
+          SDL2_DIR="${GITHUB_WORKSPACE}/SDL2-${SDL2_VERSION}"
+          mkdir build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release \
+            -DSTATIC_BUILD=ON \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="10.15" \
+            -DSDL2_STATIC_LIB="${SDL2_DIR}/build/libSDL2.a" \
+            -DSDL2_INCLUDE_DIR="${SDL2_DIR}/include"
+          make -j$(sysctl -n hw.ncpu)
+          strip tfmxplay
+
+      - name: Verify binary
+        run: |
+          lipo -info build/tfmxplay
+          otool -L build/tfmxplay
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp build/tfmxplay dist/
+          cd dist && zip ../tfmxplay-${GITHUB_REF_NAME}-macos-universal.zip tfmxplay
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: tfmxplay-*-macos-universal.zip
+
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-SDL2
+            make
+
+      - name: Build tfmxplay static
+        run: |
+          mkdir build && cd build
+          cmake .. -G "MinGW Makefiles" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSTATIC_BUILD=ON
+          mingw32-make -j$(nproc)
+          strip tfmxplay.exe
+
+      - name: Verify no external DLL deps
+        run: |
+          echo "=== Dynamic dependencies ==="
+          ldd build/tfmxplay.exe
+          echo "=== Checking for non-system DLLs ==="
+          if ldd build/tfmxplay.exe | grep -i "mingw\|msys\|libgcc\|libstdc\|libwinpthread\|SDL2.dll"; then
+            echo "ERROR: Found external DLL dependencies!"
+            exit 1
+          else
+            echo "OK: Only Windows system DLLs"
+          fi
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp build/tfmxplay.exe dist/
+          cd dist && 7z a ../tfmxplay-${GITHUB_REF_NAME}-windows-x64.zip tfmxplay.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: tfmxplay-*-windows-x64.zip
+
+  release:
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/macos-universal/*.zip
+            artifacts/windows-x64/*.zip
