@@ -20,25 +20,24 @@ jobs:
         run: |
           curl -fSL "https://github.com/libsdl-org/SDL/releases/download/release-${SDL2_VERSION}/SDL2-${SDL2_VERSION}.tar.gz" | tar xz
           cd SDL2-${SDL2_VERSION}
-          mkdir build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release \
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET="10.15" \
-            -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST=OFF
-          make -j$(sysctl -n hw.ncpu)
+            -DSDL_SHARED=OFF -DSDL_STATIC=ON \
+            -DSDL_TEST=OFF -DSDL_ASSEMBLY=OFF
+          cmake --build build --config Release -- -j$(sysctl -n hw.ncpu)
 
       - name: Build tfmxplay universal
         run: |
           SDL2_DIR="${GITHUB_WORKSPACE}/SDL2-${SDL2_VERSION}"
-          mkdir build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release \
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
             -DSTATIC_BUILD=ON \
             -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET="10.15" \
             -DSDL2_STATIC_LIB="${SDL2_DIR}/build/libSDL2.a" \
             -DSDL2_INCLUDE_DIR="${SDL2_DIR}/include"
-          make -j$(sysctl -n hw.ncpu)
-          strip tfmxplay
+          cmake --build build --config Release -- -j$(sysctl -n hw.ncpu)
+          strip build/tfmxplay
 
       - name: Verify binary
         run: |
@@ -70,17 +69,16 @@ jobs:
           install: >-
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
             mingw-w64-x86_64-SDL2
-            make
 
       - name: Build tfmxplay static
         run: |
-          mkdir build && cd build
-          cmake .. -G "MinGW Makefiles" \
+          cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DSTATIC_BUILD=ON
-          mingw32-make -j$(nproc)
-          strip tfmxplay.exe
+          cmake --build build --config Release
+          strip build/tfmxplay.exe
 
       - name: Verify no external DLL deps
         run: |
@@ -98,7 +96,8 @@ jobs:
         run: |
           mkdir -p dist
           cp build/tfmxplay.exe dist/
-          cd dist && 7z a ../tfmxplay-${GITHUB_REF_NAME}-windows-x64.zip tfmxplay.exe
+          cd dist
+          /c/Program\ Files/7-Zip/7z.exe a ../tfmxplay-${GITHUB_REF_NAME}-windows-x64.zip tfmxplay.exe
 
       - uses: actions/upload-artifact@v4
         with:
