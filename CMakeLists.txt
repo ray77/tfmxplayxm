@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.5)
-project(tfmxplay VERSION 0.0.8)
+project(tfmxplay VERSION 0.0.9)
 
 # are you kidding me?! macOS 10.15 and still no C++11 by default?!
 set(CMAKE_CXX_STANDARD 11)
@@ -16,6 +16,11 @@ if (WIN32 AND MINGW)
 elseif (WIN32)
   add_subdirectory(SDL)
   set(HAVE_SDL2 SDL2-static)
+elseif (UNIX AND NOT APPLE AND STATIC_BUILD)
+  set(SDL2_STATIC_LIB "" CACHE FILEPATH "Path to SDL2 static library (libSDL2.a)")
+  if (NOT SDL2_INCLUDE_DIR)
+    find_path(SDL2_INCLUDE_DIR SDL.h PATH_SUFFIXES SDL2)
+  endif()
 elseif (APPLE AND STATIC_BUILD)
   set(SDL2_STATIC_LIB "${CMAKE_BINARY_DIR}/libSDL2-universal.a" CACHE FILEPATH
       "Path to universal (arm64+x86_64) SDL2 static library")
@@ -65,6 +70,16 @@ if (WIN32 AND MINGW)
   endif()
 elseif (WIN32)
   target_link_libraries(tfmxplay SDL2main ${HAVE_SDL2})
+elseif (UNIX AND NOT APPLE AND STATIC_BUILD)
+  target_link_libraries(tfmxplay
+    -static-libgcc -static-libstdc++
+    -Wl,-Bstatic ${SDL2_STATIC_LIB}
+    -Wl,-Bdynamic -lpthread -ldl -lm
+    -lasound -lpulse -lpulse-simple
+    -lX11 -lXext -lXi -lXfixes -lXrandr -lXcursor -lxkbcommon
+    -lwayland-client -lwayland-cursor -lwayland-egl
+    -lEGL -lGL -lgbm -ldrm
+    -ldbus-1)
 elseif (APPLE AND STATIC_BUILD)
   target_link_libraries(tfmxplay
     ${SDL2_STATIC_LIB}

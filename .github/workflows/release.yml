@@ -61,6 +61,61 @@ jobs:
           name: macos-universal
           path: tfmxplay-*-macos-universal.zip
 
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake \
+            libasound2-dev libpulse-dev \
+            libx11-dev libxext-dev libxi-dev libxfixes-dev \
+            libxrandr-dev libxcursor-dev libxkbcommon-dev \
+            libwayland-dev libwayland-cursor0 wayland-protocols \
+            libegl-dev libgl-dev libgbm-dev libdrm-dev \
+            libdbus-1-dev
+
+      - name: Build SDL2 static
+        run: |
+          curl -fSL "https://github.com/libsdl-org/SDL/releases/download/release-${SDL2_VERSION}/SDL2-${SDL2_VERSION}.tar.gz" | tar xz
+          cd SDL2-${SDL2_VERSION}
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/sdl2-prefix" \
+            -DSDL_SHARED=OFF -DSDL_STATIC=ON \
+            -DSDL_TEST=OFF
+          cmake --build build -j$(nproc)
+          cmake --install build
+
+      - name: Build tfmxplay static
+        run: |
+          PREFIX="${GITHUB_WORKSPACE}/sdl2-prefix"
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSTATIC_BUILD=ON \
+            -DSDL2_STATIC_LIB="${PREFIX}/lib/libSDL2.a" \
+            -DSDL2_INCLUDE_DIR="${PREFIX}/include/SDL2"
+          cmake --build build -j$(nproc)
+          strip build/tfmxplay
+
+      - name: Verify binary
+        run: |
+          file build/tfmxplay
+          ldd build/tfmxplay || true
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp build/tfmxplay dist/
+          cd dist && zip ../tfmxplay-${GITHUB_REF_NAME}-linux-x64.zip tfmxplay
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: tfmxplay-*-linux-x64.zip
+
   build-windows:
     runs-on: windows-latest
     defaults:
@@ -111,7 +166,7 @@ jobs:
           path: tfmxplay-*-windows-x64.zip
 
   release:
-    needs: [build-macos, build-windows]
+    needs: [build-macos, build-linux, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -124,4 +179,5 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/macos-universal/*.zip
+            artifacts/linux-x64/*.zip
             artifacts/windows-x64/*.zip
