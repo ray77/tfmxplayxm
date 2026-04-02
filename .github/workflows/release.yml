@@ -116,6 +116,63 @@ jobs:
           name: linux-x64
           path: tfmxplay-*-linux-x64.zip
 
+  build-linux-arm64:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: uraimo/run-on-arch-action@v2
+        name: Build on ARM64
+        with:
+          arch: aarch64
+          distro: ubuntu22.04
+          githubToken: ${{ github.token }}
+          setup: mkdir -p "${PWD}/dist"
+          dockerRunArgs: --volume "${PWD}/dist:/dist"
+          install: |
+            apt-get update
+            apt-get install -y build-essential cmake curl \
+              libasound2-dev libpulse-dev \
+              libx11-dev libxext-dev libxi-dev libxfixes-dev \
+              libxrandr-dev libxcursor-dev libxkbcommon-dev \
+              libwayland-dev wayland-protocols \
+              libegl-dev libgl-dev libgbm-dev libdrm-dev \
+              libdbus-1-dev
+          run: |
+            set -e
+            SDL2_VER=2.30.9
+            curl -fSL "https://github.com/libsdl-org/SDL/releases/download/release-${SDL2_VER}/SDL2-${SDL2_VER}.tar.gz" | tar xz
+            cd SDL2-${SDL2_VER}
+            cmake -B build \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_INSTALL_PREFIX="/tmp/sdl2" \
+              -DSDL_SHARED=OFF -DSDL_STATIC=ON \
+              -DSDL_TEST=OFF
+            cmake --build build -j$(nproc)
+            cmake --install build
+            cd ..
+            cmake -B build \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DSTATIC_BUILD=ON \
+              -DSDL2_STATIC_LIB="/tmp/sdl2/lib/libSDL2.a" \
+              -DSDL2_INCLUDE_DIR="/tmp/sdl2/include/SDL2"
+            cmake --build build -j$(nproc)
+            strip build/tfmxplay
+            cp build/tfmxplay /dist/
+
+      - name: Verify binary
+        run: |
+          file dist/tfmxplay
+
+      - name: Package
+        run: |
+          cd dist && zip ../tfmxplay-${GITHUB_REF_NAME}-linux-arm64.zip tfmxplay
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64
+          path: tfmxplay-*-linux-arm64.zip
+
   build-windows:
     runs-on: windows-latest
     defaults:
@@ -166,7 +223,7 @@ jobs:
           path: tfmxplay-*-windows-x64.zip
 
   release:
-    needs: [build-macos, build-linux, build-windows]
+    needs: [build-macos, build-linux, build-linux-arm64, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -180,4 +237,5 @@ jobs:
           files: |
             artifacts/macos-universal/*.zip
             artifacts/linux-x64/*.zip
+            artifacts/linux-arm64/*.zip
             artifacts/windows-x64/*.zip
