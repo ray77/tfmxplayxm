@@ -512,6 +512,14 @@ static int calcEnvSpeed(int envAmt, int envTimeC, int xmSpeed) {
  * For multi-phase macros (e.g., loud attack then quiet sustain via mSetVol
  * after mOn), the PRE-mOn volume command defines the note-on volume in XM.
  * Post-mOn mSetVol/mAddVol only override when both are in the same phase.
+ *
+ * @param allMacros  TFMX macro table (128 macros x 256 steps); also the source
+ *                   for mCont redirects while scanning.
+ * @param macroIdx   Index of the macro to decode (0-127).
+ * @param xmSpeed    XM ticks per row; used to convert TFMX frame waits into
+ *                   row-based sustain delays for XM volume-slide timing.
+ * @return           MacroEffectInfo with XM-oriented fields; absent features
+ *                   stay at their sentinel defaults (see struct definition).
  */
 static MacroEffectInfo getMacroEffects(const TFMXMacroData allMacros[128][256],
                                        int macroIdx, int xmSpeed) {
@@ -572,6 +580,9 @@ static MacroEffectInfo getMacroEffects(const TFMXMacroData allMacros[128][256],
           int timeC = macro[i].data[0] & 0xfe;
           int amt = macro[i].data[2];
           if (timeC > 0 && amt > 0) {
+            /* Map TFMX vibrato timer/amplitude into XM effect 4xy nibbles (1-15).
+             * Ratios are empirical: coarse XM steps must approximate TFMX per-tick
+             * rates and perceptible depth without saturating the effect column. */
             int xs = 32 / timeC;
             if (xs < 1) xs = 1; if (xs > 15) xs = 15;
             int yd = (amt * timeC + 62) / 63;
@@ -763,14 +774,16 @@ efxdone:
 }
 
 /*
- * Delta-encode 8-bit sample data for the XM format with gain compensation.
- * XM stores samples as deltas: each byte = (current - previous) & 0xFF.
+ * Delta-encode 8-bit sample bytes for XM's sample storage format.
  *
- * A 2x gain compensates for the Amiga-vs-XM mixing architecture:
- * the Amiga mixes 2 channels per stereo side additively (~25% headroom
- * per channel), while XM players normalize across 8+ channels (~3-6%).
- * Boosting the sample data is the only way to restore perceived loudness,
- * since XM pattern volume already caps at 64.
+ * XM stores 8-bit samples as running deltas: each byte is
+ * (unsigned)(sample[n] - sample[n-1]).  Players integrate to recover PCM.
+ * Loudness balance vs. Amiga/TFMX is handled outside this routine
+ * (e.g. pattern volume mapping, RMS normalization before export).
+ *
+ * @param src  Input PCM; bytes are interpreted as unsigned for delta math.
+ * @param len  Byte count.
+ * @param dst  Output buffer, len bytes.
  */
 static void deltaEncode8(const signed char* src, int len, unsigned char* dst) {
   int prev = 0;
@@ -809,7 +822,7 @@ static TFMXPatData readPatEntry(const unsigned char* mdatBuf, size_t mdatSize, i
   return item;
 }
 
-/* Read big-endian u32 from raw buffer. */
+/* Read a 32-bit big-endian value from raw TFMX mdat (68000 disk order). */
 static unsigned int readBE32(const unsigned char* buf, int off) {
   return ((unsigned int)buf[off]<<24)|((unsigned int)buf[off+1]<<16)|
          ((unsigned int)buf[off+2]<<8)|(unsigned int)buf[off+3];
@@ -826,6 +839,9 @@ static unsigned int readBE32(const unsigned char* buf, int off) {
  * @param outPath   Destination path for the output XM file
  * @param subsong   Subsong index (0-31) to convert — TFMX modules can contain
  *                  multiple songs, each with its own start/end order row and speed
+ * @param pan       Stereo image preset; maps to XM panning effect 8xx per channel
+ * @return          true if conversion completed and XM was written; false on
+ *                  load, allocation, or I/O failure (see early returns)
  */
 bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath, int subsong, PanPreset pan) {
   int xmErrors = 0;
@@ -847,7 +863,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     case PAN_AMIGA:             panL = 0x00; panR = 0xFF; break;
     case PAN_HEADPHONE:         panL = 0x30; panR = 0xD0; break;
     case PAN_NEARMONO:          panL = 0x60; panR = 0xA0; break;
-    case PAN_EXPERIMENTAL_BASS: panL = 0x10; panR = 0xF0; break;
+    case PAN_EXPERIMENTAL_BASS: panL = 0x28; panR = 0xD8; break;
     default:                    panL = 0x10; panR = 0xF0; break;
   }
   const char* panNames[] = {"Soft","Amiga","Headphone","NearMono","ExperimentalBass"};
@@ -904,6 +920,8 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     }
   }
 
+  /* Append a timestamped session banner so long logs stay traceable to
+   * specific input files, subsong, and pan preset during debugging. */
   FILE* logFile = fopen(logPath, "a");
   if (logFile) {
     time_t now = time(NULL);
@@ -916,7 +934,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     fprintf(logFile, "========================================\n");
   }
 
-  /* Load smpl */
+  /* Sample file: contiguous 8-bit signed PCM; macro mSetBegin offsets slice it. */
   f = fopen(smplPath, "rb");
   if (!f) {
     perror(smplPath);
@@ -1039,6 +1057,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     }
   }
 
+  /* Order data is fixed 128x8; clamp bogus header ranges before indexing. */
   int startRow = head.songStart[subsong];
   int endRow = head.songEnd[subsong];
   if (startRow < 0) startRow = 0;
@@ -1046,6 +1065,8 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   if (endRow > 127) endRow = 127;
   if (endRow < startRow) endRow = startRow;
 
+  /* Scan for EFFE cmd==3 (7-voice timeshare mode). Reflected in XM title
+   * and used for stereo tracking; CIA/BPM timing is handled live during sim. */
   bool multimode = false;
   for (int r = startRow; r <= endRow; r++) {
     if (track[r][0].pat == 0xEF && track[r][0].trans == 0xFE) {
@@ -1053,12 +1074,11 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
       if (cmd == 3) { multimode = true; break; }
     }
   }
-  (void)multimode; /* detection logged in summary line */
 
   /* Volume mapping: wraps scaleVol() so all volume conversions in this
    * function go through a single point (easy to swap for per-mode curves). */
   auto volMap = [&](int v) -> int {
-    (void)multimode;
+    (void)multimode; /* captured for future 7-voice-specific curves */
     return scaleVol(v);
   };
 
@@ -1160,10 +1180,12 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   }
 
   int totalXmRows = 0;          /* running count of XM rows written so far */
-  int ordRowToXmRow[128];       /* maps TFMX order row index → first XM row */
+  /* Maps each TFMX order row to the first XM row it produced (-1 = never reached). */
+  int ordRowToXmRow[128];
   memset(ordRowToXmRow, -1, sizeof(ordRowToXmRow));
-  int loopJumpXmRow = -1;       /* XM row where EFFE cmd 1 (loop) was encountered */
-  int loopJumpTargetXmRow = -1; /* XM row the loop jumps back to */
+  /* Backward EFFE cmd==1: remember XM endpoints so the writer can emit Bxx/Dxx. */
+  int loopJumpXmRow = -1;
+  int loopJumpTargetXmRow = -1;
 
   /* TFMX speed = ticks per row. The header stores (speed - 1). */
   int xmSpeed = head.songSpeed[subsong] + 1;
@@ -1175,9 +1197,11 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   int eClocks = 14318;
   int xmBPM   = 125;
 
-  /* Pre-scan order table for EFFE speed changes that occur before any
-   * pattern data.  This ensures macroFX envelope calculations use the
-   * actual playback speed rather than the (potentially placeholder) header value. */
+  /* Pre-scan order table for EFFE speed changes that precede any pattern data.
+   * This ensures macroFX envelope calculations use the actual playback speed
+   * rather than the (potentially placeholder) header value.  Stop at the first
+   * non-meta row: only the leading prefix is "global setup"; later tempo
+   * changes are applied live during simulation and must not be consumed here. */
   for (int r = startRow; r <= endRow; r++) {
     if (track[r][0].pat == 0xEF && track[r][0].trans == 0xFE) {
       int cmd = (track[r][1].pat << 8) | track[r][1].trans;
@@ -1202,13 +1226,10 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     speedWasDoubled = true;
   }
 
-  /* Resolve mCont chains: if a macro's first action is mCont(target),
-   * the effective macro is the target. Build a redirect table so that
-   * sample info, effects, and hasOn checks use the resolved macro. */
-  /* Resolve mCont chains: if a macro's first opcode is mCont(target),
-   * the effective instrument is the target macro.  This is common for
-   * wavetable-attack → sustain-sample transitions.  Build a redirect
-   * table so sample info, effects, and hasOn checks use the resolved macro. */
+  /* Resolve leading mCont/mSKey chains: the audible instrument often lives
+   * in a different macro (split keyboard, short attack macro handing off to
+   * sustain).  Redirecting keeps sample/envelope resolution on the final
+   * macro while still scanning the source for pre-handoff opcodes. */
   int macroContTarget[128];
   /* mSKey (split keyboard): stores split note and alternate target.
    * When a macro starts with mSKey, notes >= sKeySplit use sKeyHigh target;
@@ -1325,6 +1346,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     }
     (void)macroFX[i];
     atkInstMap[i] = 0;
+    /* Fixed-pitch attack only; ignore tiny glitches; attack inst = i+65 must fit 1..128 */
     if (macroSI[i].setNoteVal < 0 || macroSI[i].atkLen < 32 || i + 64 >= 128)
       continue;
     int as = macroSI[i].atkStart, al = macroSI[i].atkLen;
@@ -1439,9 +1461,10 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   /*
    * Initialize track states from an order table row.
    * Each of the 8 tracks reads its pattern assignment and transposition.
-   * Special pattern values are handled: 0x80 (continue), 0xFE (channel off),
-   * 0xFF (inactive). For normal patterns (0-127), the track resets to the
-   * first step of the referenced pattern.
+   * Special pattern values: 0x80 = continue current pattern, 0xFE = channel
+   * off, 0xFF = inactive/unused.  Other pat >= 0x80 are not valid pattern
+   * indices and are parked to avoid out-of-bounds access.  For normal
+   * patterns (0-127), the track resets to the first step of the pattern.
    */
   auto initOrderRow = [&](int ordRow) {
     for (int t = 0; t < 8; t++) {
@@ -1477,8 +1500,9 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
    * row at a time; within each row, we tick until any track hits pEnd
    * (which means this order row is finished). */
   for (int ordRow = startRow; ordRow <= endRow && totalXmRows < MAX_TOTAL_ROWS; ordRow++) {
-    /* Special order row commands: pat=0xEF, trans=0xFE on track 0 signals
-     * a meta-command. cmd=0: stop song, cmd=1: jump to row, cmd=2: tempo. */
+    /* EFFE row: tracks 1-3 pack cmd/w2/w3 as big-endian words.
+     * cmd=0 ends subsong; cmd=1 jumps (backward → loop, forward → skip);
+     * cmd=2 changes tick/BPM; cmd=3 activates 7-voice timeshare mode. */
     if (track[ordRow][0].pat == 0xEF && track[ordRow][0].trans == 0xFE) {
       int cmd = (track[ordRow][1].pat << 8) | track[ordRow][1].trans;
       int w2  = (track[ordRow][2].pat << 8) | track[ordRow][2].trans;
@@ -1507,7 +1531,9 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
           xmSpeed = newSpeed;
           if (newSpeed > 2) speedWasDoubled = false;
         }
-        /* Optional CIA override in w3 */
+        /* When w3 low 9 bits hold a raw Amiga CIA period (not alternate high-bit
+         * layout 0xF200), convert to eClocks then BPM.  0x1B51F8 and 1790456
+         * are Amiga master-clock constants matching the reference player. */
         if (!(w3 & 0xF200) && (w3 & 0x1FF) > 0xF) {
           eClocks = 0x1B51F8 / (w3 & 0x1FF);
           int newBPM = (int)(1790456.0 / eClocks + 0.5);
@@ -1559,6 +1585,8 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
      * it reads pattern commands until it either hits a pWait (sets a new
      * timer) or a pEnd (signals end of this order row section). */
     bool rowDone = false;
+    /* Corrupt or pathological patterns (tight pLoop without progress) can
+     * otherwise run unbounded; cap outer row generation per order row. */
     int safety = 16384;
     while (!rowDone && totalXmRows < MAX_TOTAL_ROWS && --safety > 0) {
       bool anyActive = false;
@@ -1568,6 +1596,8 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
 
         anyActive = true;
         bool getMeOut = false;
+        /* One XM row can consume many TFMX pattern cells in a single tick
+         * (sequential commands with no pWait); bound independently of rows. */
         int innerSafety = 512;
         while (!getMeOut && !rowDone && --innerSafety > 0) {
           ts[t].pos++;
@@ -1638,6 +1668,9 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                 ts[t].inGosub = false;
               }
               break;
+            /* Pattern envelope: reconfigures per-channel fade rate/limit;
+             * recorded here and applied in the per-row pass so ~50 Hz TFMX
+             * hardware fades match xmSpeed-scaled XM rows. */
             case pEnve: {
               int ch = item.chan;
               if (ch >= 0 && ch < BASE_CHANS) {
@@ -1721,6 +1754,8 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                 int portaRate  = item.detune;
                 int portaReset = item.ins;
                 if (portaReset < 1) portaReset = 1;
+                /* Single 3xx value must approximate TFMX's per-frame multiplicative
+                 * period update; blend detune strength and reset interval. */
                 int xmParam = (portaRate * 5 + portaReset * 2)
                               / (portaReset * 4);
                 if (xmParam < 1) xmParam = 1;
@@ -1770,6 +1805,8 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                   bool emptyMacro = (effectiveIns >= 0 && effectiveIns < 128 &&
                                      !macroHasOn[effectiveIns]);
                   int useInst = effectiveIns;
+                  /* No mOn in this macro: Amiga hardware keeps the previous DMA
+                   * path; reuse last triggered macro for XM sample/volume mapping. */
                   if (emptyMacro && chanLastMacro[ch] >= 0 &&
                       chanLastMacro[ch] < 128 && macroHasOn[chanLastMacro[ch]])
                     useInst = chanLastMacro[ch];
@@ -1906,8 +1943,10 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
       if (totalXmRows < MAX_TOTAL_ROWS && !rowDone) {
         for (int c = 0; c < BASE_CHANS; c++) {
           if (!chanEnv[c].active) continue;
+          /* Approximate multiple Amiga envelope ticks per XM row without
+           * exceeding xmSpeed steps (keeps chord-style fades from stalling). */
           int envFrames = (xmSpeed * 2 + 2) / 3;
-          /* Akkord-Pads (pEnve → 0): schneller ausfaden pro Tick */
+          /* Target zero = full mute: step once per tick so silence aligns. */
           if (chanEnv[c].target == 0 && chanEnv[c].vol > 0)
             envFrames = xmSpeed;
           if (envFrames < 1) envFrames = 1;
@@ -2027,10 +2066,9 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     }
   }
 
-  /* ExperimentalBass: force bass and drum instruments to center (0x80).
-   * Bass heuristic: average played note <= C-3 (XM note 37) considering
-   * the instrument's relativeNote (addNote) transposition.
-   * Drum heuristic: oneShot sample shorter than 6144 bytes. */
+  /* ExperimentalBass: force bass, bassline and drum instruments to center.
+   * Bass/Bassline: effective average note <= C-4 (XM note 49).
+   * Drum: oneShot sample shorter than 6144 bytes. */
   bool instCenterPan[128];
   memset(instCenterPan, 0, sizeof(instCenterPan));
   if (pan == PAN_EXPERIMENTAL_BASS) {
@@ -2038,14 +2076,18 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
       if (instNoteCount[i] == 0) continue;
       int avgNote = (int)(instNoteSum[i] / instNoteCount[i]);
       int effNote = avgNote + macroSI[i].addNote;
-      bool isBass = (effNote <= 37);
+      bool isBass = (effNote <= 49);
       bool isDrum = macroSI[i].oneShot && macroSI[i].len > 0 && macroSI[i].len < 6144;
       if (isBass || isDrum) {
         instCenterPan[i] = true;
         instSamplePan[i] = 0x80;
+        const char* tag = isDrum ? "DRUM" : "BASS";
         if (logFile)
           fprintf(logFile, "  EXBASS center Inst %d: avgNote=%d addNote=%d effNote=%d %s\n",
-                 i+1, avgNote, macroSI[i].addNote, effNote, isBass ? "BASS" : "DRUM");
+                 i+1, avgNote, macroSI[i].addNote, effNote, tag);
+      } else if (logFile) {
+        fprintf(logFile, "  EXBASS skip   Inst %d: avgNote=%d addNote=%d effNote=%d\n",
+               i+1, avgNote, macroSI[i].addNote, effNote);
       }
     }
   }
@@ -2293,6 +2335,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
         if (fix.channel != -1 && fix.channel != c) continue;
         int rStart = (fix.fromRow >= 0) ? fix.fromRow : 0;
         int rEnd   = (fix.toRow >= 0) ? fix.toRow : totalXmRows;
+        /* Far below any real row so the first kept note always passes minNoteGap */
         int lastKeptRow = -9999;
         bool inserted_off = false;
         for (int row = rStart; row < rEnd && row < totalXmRows; row++) {
@@ -2354,7 +2397,9 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     int stutterPhase = 0;           /* current position within the stutter cycle */
     int stutterDelayLeft = 0;       /* macro frames to wait before stutter starts */
     int stutterFadeCycles = 0;      /* cycles until stutter amplitude settles */
-    int xmTicksPerRow = (xmSpeed > 1) ? (xmSpeed - 1) : 1; /* ticks available for slides */
+    /* XM volume slides apply on ticks 1..(xmSpeed-1); scale per-row deltas
+     * by this count so runningVol tracks the actual change those slides produce. */
+    int xmTicksPerRow = (xmSpeed > 1) ? (xmSpeed - 1) : 1;
     /* Determine stereo side for this channel.
      * Amiga has 4 hardware channels with fixed panning: 0=L, 1=R, 2=R, 3=L.
      * In 7-voice (multimode), the mapping is different because 8 TFMX
@@ -2516,6 +2561,8 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
         } else if (envSlide < 0) {
           inRelease = true;
         } else {
+          /* No macro release rate: pick an XM 6x slide speed (~3 units/tick max)
+           * so level decays over roughly one row instead of an instant cut. */
           int s = 4;
           if (runningVol > 0) {
             s = (runningVol + xmTicksPerRow * 3 - 1) / (xmTicksPerRow * 3);
@@ -2772,7 +2819,8 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     xmChans = usedChans;
   }
 
-  /* Slice total rows into 64-row XM patterns */
+  /* Slice total rows into 64-row XM patterns.  XM order table and Bxx effect
+   * both use 8-bit pattern indices, capping us at 256 patterns maximum. */
   int numPatterns = (totalXmRows + ROWS_PER_PAT - 1) / ROWS_PER_PAT;
   if (numPatterns < 1) numPatterns = 1;
   if (numPatterns > 256) numPatterns = 256;
@@ -2837,8 +2885,10 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     }
     size_t packedSize = (size_t)(p - packed);
 
+    /* Pattern header: 9 = FT2 fixed prelude size (length dword + packing byte
+     * + row count word + packed-data size word) before the cell stream. */
     writeU32(out, 9);
-    fputc(0, out);
+    fputc(0, out);                              /* packing type (always 0) */
     writeU16(out, (unsigned short)patRows);
     writeU16(out, (unsigned short)packedSize);
     fwrite(packed, 1, packedSize, out);
@@ -2899,6 +2949,8 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
           xmLoopLen = (unsigned int)smpLen - xmLoopStart;
         if (xmLoopLen < 2) xmLoopLen = 2;
       } else {
+        /* No explicit loop in TFMX: sustained playback wraps the full sample;
+         * map to a forward XM loop spanning the entire waveform. */
         loopType = 1;
         xmLoopStart = 0;
         xmLoopLen = (unsigned int)smpLen;
@@ -2969,6 +3021,9 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
           srcLen = (int)smplLen - smpStart;
         if (srcLen > origLen) {
           const signed char* src = smpl + smpStart;
+          /* Paula advances ~256 bytes per frame at reference note C-4 (49);
+           * scale by semitone offset so baked sweep window count matches
+           * real playback time at the instrument's actual pitch. */
           int baseNote = 49;
           if (instFirstXmNote[inst] > 0)
             baseNote = instFirstXmNote[inst];
