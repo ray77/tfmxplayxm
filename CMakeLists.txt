@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.5)
-project(tfmxplay VERSION 0.0.7)
+project(tfmxplay VERSION 0.0.8)
 
 # are you kidding me?! macOS 10.15 and still no C++11 by default?!
 set(CMAKE_CXX_STANDARD 11)
