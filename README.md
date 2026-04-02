@@ -1,45 +1,138 @@
 # tfmxplay XM
+
 ![TFMXPlay Logo](img/logo.png)
 
-The Player / Converter strives to meet Turrican 2 standards.
-The new XM Converter generates an easily editable, readable XM file. (No data mush like with similar converters.) Macros are mapped to additional tracks using XM note parameters. As a result, the converted songs may not sound 100% like the original, but they are easy to edit.
+TFMX (The Final Musicsystem eXtended) player and converter for Chris Huelsbeck's Amiga music format. Converts TFMX modules (mdat + smpl) into high-quality, editable XM (FastTracker II) files — playable in Schism Tracker, MilkyTracker, OpenMPT and others.
 
-XM-CONVERTER - EARLY ALPHA-VERSION: Only testet with T2_WORLD1_SONG0 *wait for updates*
+Unlike other TFMX converters, tfmxplay produces clean, human-readable XM files where macros are mapped to dedicated tracks using XM note parameters. The result is easy to edit and remix.
 
-## Runtime keys
+## Downloads
+
+Pre-built static binaries (no dependencies required):
+
+| Platform | Binary |
+|----------|--------|
+| macOS (Apple Silicon + Intel) | [Universal Binary](https://github.com/ray77/tfmxplayxm/releases/latest) |
+| Linux x86_64 | [Static Binary](https://github.com/ray77/tfmxplayxm/releases/latest) |
+| Linux ARM64 (Raspberry Pi) | [Static Binary](https://github.com/ray77/tfmxplayxm/releases/latest) |
+| Windows x64 | [Static .exe](https://github.com/ray77/tfmxplayxm/releases/latest) |
+
+## XM Conversion
+
+```bash
+# Basic conversion (default panning: Soft)
+tfmxplay mdat.T2_World1 -convert2xm=t2world1.xm
+
+# With subsong selection
+tfmxplay mdat.T2_World1 -subsong 3 -convert2xm=t2w1_sub03.xm
+
+# With panning preset
+tfmxplay mdat.T2_Title -subsong 0 -convert2xm=t2title.xm -pan=ExperimentalBass
+```
+
+### Panning Presets
+
+| Preset | Description |
+|--------|-------------|
+| **Soft** (default) | Gentle stereo separation, good for headphones and speakers |
+| **Amiga** | Original hard left/right Amiga panning |
+| **Headphone** | Narrow stereo image, comfortable for long listening |
+| **NearMono** | Almost mono, minimal stereo separation |
+| **ExperimentalBass** | Bass and drums centered, rest with narrowed stereo — best for modern mixes |
+
+### Conversion Log
+
+Each conversion appends diagnostics to `conversion.log` in the output directory — instrument mapping, volume scaling, panning decisions, and sweep baking details. Useful for debugging and tuning. Logs auto-rotate at ~1 MB (keeps 9 old files).
+
+## Playback
+
+```bash
+# Play a TFMX module
+tfmxplay mdat.T2_World1
+
+# Play specific subsong
+tfmxplay mdat.T2_World1 -subsong 4
+
+# Dump to WAV
+tfmxplay mdat.T2_Title -dump
+```
+
+### Runtime Keys
 
 Keys are read from the terminal while the player is running.
 
-![Console01](img/console01.png)
+![Console](img/console01.png)
 
 | Key | Action |
 |-----|--------|
 | **Tab** | Next subsong |
 | **Shift+Tab** | Previous subsong |
-| **Enter** / **Return** | Toggle frame trace |
-| **\\** (backslash) | Set tempo to 6× (70937×6), show CIA value |
-| **~** (tilde) | Toggle register trace |
-| **Backspace** / **Delete** | Reset tempo to default (PAL 70937 / NTSC 59659) |
-| **[** | Increase tempo (~9%) |
-| **]** | Decrease tempo (~9%) |
-| **{** | Double tempo |
-| **}** | Halve tempo |
-| **`** (backtick) | Toggle NTSC/PAL |
-| **1** | Show channel 0 mute status |
-| **2** | Show channel 1 mute status |
-| **3** | Show channel 2 mute status |
-| **4** | Show channel 3 mute status |
-| **5** | Toggle channel 0 macro trace |
-| **6** | Toggle channel 1 macro trace |
-| **7** | Toggle channel 2 macro trace |
-| **8** | Toggle channel 3 macro trace |
-| **A–Z** | Lock channel 3, play macro 0–25 (volume 20, 15) |
+| **Enter** | Toggle frame trace |
+| **\\** | Set tempo to 6x, show CIA value |
+| **~** | Toggle register trace |
+| **Backspace** | Reset tempo to default (PAL/NTSC) |
+| **[ / ]** | Increase / decrease tempo (~9%) |
+| **{ / }** | Double / halve tempo |
+| **`** | Toggle NTSC/PAL |
+| **1-4** | Show channel 0-3 mute status |
+| **5-8** | Toggle channel 0-3 macro trace |
+| **A-Z** | Lock channel 3, play macro 0-25 |
 | **Ctrl+C** | Quit |
 
+## Command-Line Options
 
-EXAMPLE:
-./tfmxplay -convert2xm=T2w1.xm mdat.T2_World1
+```
+General:
+  -h, --help              Display help
+  -v, --version           Show version
+  -i, --info              Show TFMX module info (header, subsongs, format)
 
-*** Try with Turrican 2 World 01 (SUB00) *** ENJOY!
+Playback:
+  -s, --subsong (num)     Select subsong
+  -n, --ntsc              Use NTSC rate
+  -l, --hle               High-level emulation (lower quality, faster)
+  -d, --dump              Dump 16-bit stereo output to tfmx.wav
+  -S, --speed             Set speed in clock/2 cycles
+  -M, --mute (channels)   Mute channels (e.g. -M 123 mutes ch 1,2,3)
+
+XM Conversion:
+  -c, --convert2xm[=file] Convert TFMX to XM file
+  -p, --pan (preset)      Panning: Amiga, Soft, Headphone, NearMono, ExperimentalBass
+```
+
+## Building from Source
+
+Requires CMake and SDL2.
+
+```bash
+# macOS / Linux
+cmake -B build
+cmake --build build
+
+# Static build (no external dependencies)
+cmake -B build -DSTATIC_BUILD=ON
+cmake --build build
+```
+
+## How It Works
+
+1. **Load** the mdat (music data) and smpl (sample data) files
+2. **Simulate** TFMX playback tick-by-tick, writing note/volume events into a linear XM row grid
+3. **Post-process**: apply effective volumes, vibrato, sustain/release envelopes, stereo panning, and song-specific patches
+4. **Write** the XM file with delta-encoded 8-bit samples, packed pattern data, and instrument headers
+
+TFMX macros (mSetBegin, mOn, mAddVol, mVibrato, mEnv, mWaitUp, etc.) are translated into XM equivalents — volume column effects, effect column commands, and instrument parameters. Multi-phase macros (attack + sustain), sweep baking (mAddBegin), and DMA retrigger loops are handled automatically.
+
+## Tested With
+
+- Turrican 1 (mdat.title)
+- Turrican 2 (T2_Title, T2_World1, T2_World2, T2_World5, and others)
+- Various other TFMX modules
+
+## Credits
+
+- **Chris Huelsbeck** — TFMX music system and Turrican soundtracks
+- **ray77** — tfmxplay XM converter
+- **tildearrow** — tfmxplay core engine
 
 ![hippo](img/v001.gif)
