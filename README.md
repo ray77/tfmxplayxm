@@ -8,7 +8,7 @@ Unlike other TFMX converters, tfmxplay produces clean, human-readable XM files w
 
 ### Listen
 
-[**Turrican 2 — World 1 (XM conversion demo, MP3)**](audio/demo_t2world1.mp3) — download and listen
+[**Turrican 2 — World 1 (XM conversion demo)**](https://cdn.jsdelivr.net/gh/ray77/tfmxplayxm@master/audio/demo_t2world1.mp3) — click to play in browser
 
 ## Downloads
 
