@@ -1,6 +1,6 @@
 # tfmxplay XM
 
-![TFMXPlay Logo](img/logo.png)
+<p align="center"><img src="img/logo.png" alt="TFMXPlay Logo" width="400"></p>
 
 TFMX (The Final Musicsystem eXtended) player and converter for Chris Huelsbeck's Amiga music format. Converts TFMX modules (mdat + smpl) into high-quality, editable XM (FastTracker II) files — playable in Schism Tracker, MilkyTracker, OpenMPT and others.
 
