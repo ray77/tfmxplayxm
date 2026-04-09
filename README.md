@@ -4,6 +4,10 @@
 
 TFMX (The Final Musicsystem eXtended) player and converter for Chris Huelsbeck's Amiga music format. Converts TFMX modules (mdat + smpl) into high-quality, editable XM (FastTracker II) files — playable in Schism Tracker, MilkyTracker, OpenMPT and others.
 
+The **XM converter** is the main focus of this project and produces remarkably accurate results, especially for **Turrican 2** — volume envelopes, vibrato, sweep effects, multi-phase macros and stereo panning are carefully translated to XM equivalents. Other TFMX modules (Turrican 1, Turrican 3, etc.) also work but may need further tuning.
+
+The built-in **player** is functional but still work in progress — for the best listening experience, convert to XM and use a dedicated tracker like [Schism Tracker](http://schismtracker.org/) or [OpenMPT](https://openmpt.org/).
+
 Unlike other TFMX converters, tfmxplay produces clean, human-readable XM files where macros are mapped to dedicated tracks using XM note parameters. The result is easy to edit and remix.
 
 ### Listen
