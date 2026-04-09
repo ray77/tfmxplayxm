@@ -14,11 +14,11 @@ Unlike other TFMX converters, tfmxplay produces clean, human-readable XM files w
 
 This MP3 was rendered directly from the XM file that tfmxplay's converter produced — TFMX mdat → XM → WAV → MP3, fully automated, no manual editing.
 
-[**Turrican 2 — Title, Subsong 00 (converted by tfmxplay XM)**](https://cdn.jsdelivr.net/gh/ray77/tfmxplayxm@master/audio/T2_Title_Sub00_XM_Convert.mp3) — click to play in browser
+[**Turrican 2 — Title (Subsong 00)**](https://cdn.jsdelivr.net/gh/ray77/tfmxplayxm@master/audio/T2_Title_Sub00_XM_Convert.mp3) — click to play in browser
 
-[**Turrican 2 — Title, Subsong 02 / Turrican 1 — World 1 (converted by tfmxplay XM)**](https://cdn.jsdelivr.net/gh/ray77/tfmxplayxm@master/audio/T2_Title_Sub02_XM_Convert.mp3) — click to play in browser
+[**Turrican 2 — Title (Subsong 02)**](https://cdn.jsdelivr.net/gh/ray77/tfmxplayxm@master/audio/T2_Title_Sub02_XM_Convert.mp3) — click to play in browser
 
-[**Turrican 2 — World 1, Subsong 02 (converted by tfmxplay XM)**](https://cdn.jsdelivr.net/gh/ray77/tfmxplayxm@master/audio/T2_World1_Sub02_XM_Convert.mp3) — click to play in browser
+[**Turrican 2 — World 1 (Subsong 02)**](https://cdn.jsdelivr.net/gh/ray77/tfmxplayxm@master/audio/T2_World1_Sub02_XM_Convert.mp3) — click to play in browser
 
 ## Downloads
 
