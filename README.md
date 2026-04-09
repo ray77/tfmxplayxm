@@ -12,7 +12,9 @@ Unlike other TFMX converters, tfmxplay produces clean, human-readable XM files w
 
 ### Listen
 
-[**Turrican 2 — World 1 (XM conversion demo)**](https://cdn.jsdelivr.net/gh/ray77/tfmxplayxm@master/audio/T2_World1_XM_Convert.mp3) — click to play in browser
+This MP3 was rendered directly from the XM file that tfmxplay's converter produced — TFMX mdat → XM → WAV → MP3, fully automated, no manual editing.
+
+[**Turrican 2 — World 1 (converted by tfmxplay XM)**](https://cdn.jsdelivr.net/gh/ray77/tfmxplayxm@master/audio/T2_World1_XM_Convert.mp3) — click to play in browser
 
 ## Downloads
 
