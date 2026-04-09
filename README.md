@@ -18,7 +18,7 @@ This MP3 was rendered directly from the XM file that tfmxplay's converter produc
 
 [**Turrican 2 — Title (Subsong 02)**](https://cdn.jsdelivr.net/gh/ray77/tfmxplayxm@master/audio/T2_Title_Sub02_XM_Convert.mp3) — click to play in browser
 
-[**Turrican 1 — World 1 (Subsong 02)**](https://cdn.jsdelivr.net/gh/ray77/tfmxplayxm@master/audio/T2_World1_Sub02_XM_Convert.mp3) — click to play in browser
+[**Turrican 2 — World 1 (Subsong 02)**](https://cdn.jsdelivr.net/gh/ray77/tfmxplayxm@master/audio/T2_World1_Sub02_XM_Convert.mp3) — click to play in browser
 
 ## Downloads
 
