@@ -6,6 +6,10 @@ TFMX (The Final Musicsystem eXtended) player and converter for Chris Huelsbeck's
 
 Unlike other TFMX converters, tfmxplay produces clean, human-readable XM files where macros are mapped to dedicated tracks using XM note parameters. The result is easy to edit and remix.
 
+### Listen
+
+[**Turrican 2 — World 1 (XM conversion demo)**](audio/demo_t2world1.mp3?raw=true) — click to play in browser
+
 ## Downloads
 
 Pre-built static binaries (no dependencies required):
